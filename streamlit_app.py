@@ -76,9 +76,9 @@ class AnalysisConfig:
     """Configuration for the overlap analysis."""
     min_clicks: int = 1
     serp_overlap_threshold: float = 50.0
-    max_queries: int = 100
     api_delay: float = 1.0
     batch_size: int = 10
+    # Removed max_queries - no artificial limits per user request
 
 class EnhancedCSVProcessor:
     """Enhanced CSV processor with automatic delimiter detection and flexible column mapping."""
@@ -416,7 +416,7 @@ class StreamlitGSCAnalyzer:
                 st.session_state.serp_api_client = SerpAPIClient(api_key=serp_api_key)
     
     def _render_analysis_parameters(self):
-        """Render analysis parameters section."""
+        """Render analysis parameters section - NO query limits per user request."""
         config = st.session_state.analysis_config
         
         config.min_clicks = st.sidebar.number_input(
@@ -436,15 +436,6 @@ class StreamlitGSCAnalyzer:
             help="Threshold for high SERP overlap classification"
         )
         
-        config.max_queries = st.sidebar.number_input(
-            "Max Queries to Analyze",
-            min_value=10,
-            max_value=1000,
-            value=config.max_queries,
-            step=10,
-            help="Maximum number of queries to analyze (cost control)"
-        )
-        
         config.api_delay = st.sidebar.slider(
             "API Delay (seconds)",
             min_value=0.5,
@@ -454,9 +445,11 @@ class StreamlitGSCAnalyzer:
             help="Delay between API calls to avoid rate limiting"
         )
         
-        # Cost estimation
-        estimated_cost = (config.max_queries / 1000) * 1.0
-        st.sidebar.info(f"💰 Estimated cost: ${estimated_cost:.2f}")
+        # Show actual query count instead of artificial limits
+        if st.session_state.gsc_data is not None:
+            df = st.session_state.gsc_data
+            eligible_queries = len(df[df['clicks'] >= config.min_clicks])
+            st.sidebar.info(f"📊 Queries to analyze: {eligible_queries:,}")
     
     def _process_uploaded_file(self, uploaded_file):
         """Process the uploaded GSC CSV file with enhanced error handling."""
@@ -542,12 +535,12 @@ class StreamlitGSCAnalyzer:
         st.markdown("### 📋 Required Data Format")
         st.markdown("""
         Your GSC CSV export should contain these columns (flexible naming supported):
-        - **Query/Queries**: Search terms
-        - **URL/Page**: Landing page URLs  
+        - **Query/Queries**: Search terms *(required)*
+        - **URL/Page**: Landing page URLs *(required)*
         - **Clicks**: Number of clicks *(required)*
-        - **Impressions**: Number of impressions
-        - **CTR**: Click-through rate
-        - **Position**: Average position
+        - **Impressions**: Number of impressions *(optional)*
+        - **CTR**: Click-through rate *(optional)*
+        - **Position**: Average position *(optional)*
         """)
     
     def _render_analysis_interface(self):
@@ -663,22 +656,23 @@ class StreamlitGSCAnalyzer:
         }
     
     def _analyze_serp_overlaps(self, df: pd.DataFrame, config: AnalysisConfig, progress_bar, status_text) -> Dict[str, Any]:
-        """Analyze SERP overlaps between queries with enhanced error handling."""
+        """Analyze SERP overlaps between queries with NO artificial limits."""
         # Filter queries with minimum clicks
         query_df = df[df['clicks'] >= config.min_clicks].copy()
         
-        # Get top queries (limited by config)
-        top_queries = query_df.nlargest(config.max_queries, 'clicks')['query'].unique()
+        # Get ALL unique queries (no limit) - sort by clicks for better progress tracking
+        top_queries = query_df.sort_values('clicks', ascending=False)['query'].unique()
         
         # Get SERP data
         serp_data = {}
         api_client = st.session_state.serp_api_client
         
         total_queries = len(top_queries)
+        st.info(f"🔍 Analyzing SERP data for {total_queries:,} queries. This may take several minutes...")
         
         for i, query in enumerate(top_queries):
             try:
-                status_text.text(f"🔍 Analyzing SERP for: {query[:50]}... ({i+1}/{total_queries})")
+                status_text.text(f"🔍 Analyzing SERP for: {query[:50]}... ({i+1:,}/{total_queries:,})")
                 
                 # Get SERP results
                 serp_results = api_client.search(query, num_results=10)
@@ -744,14 +738,26 @@ class StreamlitGSCAnalyzer:
         return reports
     
     def _create_url_based_report(self, df: pd.DataFrame, results: Dict[str, Any], config: AnalysisConfig) -> pd.DataFrame:
-        """Create comprehensive URL-based analysis report."""
-        url_stats = df.groupby('url').agg({
-            'clicks': 'sum',
-            'impressions': 'sum',
-            'query': 'nunique'
-        }).round(2)
+        """Create comprehensive URL-based analysis report with optional column support."""
         
-        url_stats.columns = ['total_clicks', 'total_impressions', 'unique_queries']
+        # Build aggregation dictionary based on available columns
+        agg_dict = {'query': 'nunique'}  # Always available
+        
+        if 'clicks' in df.columns:
+            agg_dict['clicks'] = 'sum'
+        if 'impressions' in df.columns:
+            agg_dict['impressions'] = 'sum'
+        
+        url_stats = df.groupby('url').agg(agg_dict).round(2)
+        
+        # Rename columns for clarity
+        column_rename = {'query': 'unique_queries'}
+        if 'clicks' in url_stats.columns:
+            column_rename['clicks'] = 'total_clicks'
+        if 'impressions' in url_stats.columns:
+            column_rename['impressions'] = 'total_impressions'
+        
+        url_stats = url_stats.rename(columns=column_rename)
         
         # Add query overlap information
         query_overlaps = results.get('query_overlap', {}).get('overlaps', [])
@@ -771,16 +777,25 @@ class StreamlitGSCAnalyzer:
         
         url_stats['high_serp_overlaps'] = url_stats.index.map(lambda x: high_serp_overlaps.get(x, 0))
         
-        # Add top queries
-        top_queries = df.groupby('url').apply(
-            lambda x: ', '.join(x.nlargest(3, 'clicks')['query'].values)
-        )
+        # Add top queries - Fix pandas warning
+        if 'clicks' in df.columns:
+            top_queries = (
+                df.groupby('url', group_keys=False)[['query', 'clicks']]
+                .apply(lambda g: ', '.join(g.nlargest(3, 'clicks')['query'].values), include_groups=False)
+            )
+        else:
+            # Fallback if no clicks column
+            top_queries = (
+                df.groupby('url', group_keys=False)['query']
+                .apply(lambda g: ', '.join(g.head(3).values), include_groups=False)
+            )
+        
         url_stats['top_queries'] = top_queries
         
         return url_stats.reset_index()
     
     def _create_query_based_report(self, df: pd.DataFrame, results: Dict[str, Any], config: AnalysisConfig) -> pd.DataFrame:
-        """Create detailed query-based analysis report."""
+        """Create detailed query-based analysis report with defensive column handling."""
         serp_overlaps = results.get('serp_overlap', {}).get('overlaps', [])
         
         query_report_data = []
@@ -807,8 +822,15 @@ class StreamlitGSCAnalyzer:
         if query_report_data:
             query_report = pd.DataFrame(query_report_data)
             
-            # Add performance metrics
-            performance_data = df[['url', 'query', 'clicks', 'impressions', 'ctr', 'position']].copy()
+            # Add performance metrics - ONLY include columns that actually exist
+            available_perf_cols = ['url', 'query']  # Always required
+            optional_cols = ['clicks', 'impressions', 'ctr', 'position']
+            
+            for col in optional_cols:
+                if col in df.columns:
+                    available_perf_cols.append(col)
+            
+            performance_data = df[available_perf_cols].copy()
             
             query_report = query_report.merge(
                 performance_data,
@@ -972,19 +994,20 @@ class StreamlitGSCAnalyzer:
         
         # Top URL Performance
         df = st.session_state.gsc_data
-        top_urls = df.groupby('url').agg({
-            'clicks': 'sum',
-            'impressions': 'sum'
-        }).sort_values('clicks', ascending=False).head(10)
-        
-        fig_urls = px.bar(
-            x=top_urls.index,
-            y=top_urls['clicks'],
-            title="Top 10 URLs by Clicks",
-            labels={'x': 'URL', 'y': 'Total Clicks'}
-        )
-        fig_urls.update_xaxes(tickangle=45)
-        st.plotly_chart(fig_urls, use_container_width=True)
+        if 'clicks' in df.columns:
+            top_urls = df.groupby('url').agg({
+                'clicks': 'sum',
+                'impressions': 'sum' if 'impressions' in df.columns else lambda x: 0
+            }).sort_values('clicks', ascending=False).head(10)
+            
+            fig_urls = px.bar(
+                x=top_urls.index,
+                y=top_urls['clicks'],
+                title="Top 10 URLs by Clicks",
+                labels={'x': 'URL', 'y': 'Total Clicks'}
+            )
+            fig_urls.update_xaxes(tickangle=45)
+            st.plotly_chart(fig_urls, use_container_width=True)
     
     def _generate_insights(self, results: Dict[str, Any]) -> List[str]:
         """Generate actionable insights from analysis results."""
@@ -1008,12 +1031,13 @@ class StreamlitGSCAnalyzer:
         
         # Performance insights
         df = st.session_state.gsc_data
-        zero_click_queries = len(df[df['clicks'] == 0])
-        total_queries = len(df)
-        
-        if zero_click_queries > 0:
-            zero_click_pct = (zero_click_queries / total_queries) * 100
-            insights.append(f"{zero_click_pct:.1f}% of queries have zero clicks - potential optimization opportunities")
+        if 'clicks' in df.columns:
+            zero_click_queries = len(df[df['clicks'] == 0])
+            total_queries = len(df)
+            
+            if zero_click_queries > 0:
+                zero_click_pct = (zero_click_queries / total_queries) * 100
+                insights.append(f"{zero_click_pct:.1f}% of queries have zero clicks - potential optimization opportunities")
         
         if not insights:
             insights.append("Analysis complete - review the detailed reports for specific optimization opportunities")
