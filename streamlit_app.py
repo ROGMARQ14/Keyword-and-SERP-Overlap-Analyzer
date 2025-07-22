@@ -3,7 +3,7 @@ GSC Keyword Cannibalization Analyzer
 Enterprise-grade application for detecting true keyword cannibalization issues
 
 Focuses specifically on identifying cases where multiple URLs are splitting traffic
-for the same queries, indicating genuine cannibalization problems.
+for the same queries, with severity based on business impact (% of total clicks).
 """
 
 import streamlit as st
@@ -302,10 +302,10 @@ class StreamlitGSCAnalyzer:
         st.markdown('<h1 class="main-header">🔍 GSC Keyword Cannibalization Analyzer</h1>', 
                    unsafe_allow_html=True)
         st.markdown("""
-        **Identify TRUE keyword cannibalization issues through click distribution analysis**
+        **Identify TRUE keyword cannibalization issues based on business impact**
         
         This tool analyzes Google Search Console data to identify cases where multiple URLs 
-        are actually splitting traffic for the same queries, indicating real cannibalization problems.
+        are splitting traffic for the same queries, with severity based on % of total website clicks.
         """)
     
     def render_sidebar(self):
@@ -360,14 +360,16 @@ class StreamlitGSCAnalyzer:
             max_value=50.0,
             value=config.click_distribution_threshold,
             step=1.0,
-            help="Minimum click percentage for a URL to be considered in cannibalization (10% = at least 2 URLs must have 10%+ of clicks each)"
+            help="Minimum click percentage for a URL to be considered in cannibalization"
         )
         
-        # Show query count
+        # Show query count and total clicks
         if st.session_state.gsc_data is not None:
             df = st.session_state.gsc_data
             eligible_queries = len(df[df['clicks'] >= config.min_clicks])
+            total_clicks = df['clicks'].sum()
             st.sidebar.info(f"📊 Queries to analyze: {eligible_queries:,}")
+            st.sidebar.info(f"🎯 Total website clicks: {total_clicks:,}")
     
     def _process_uploaded_file(self, uploaded_file):
         """Process the uploaded GSC CSV file."""
@@ -409,25 +411,24 @@ class StreamlitGSCAnalyzer:
         with col2:
             st.markdown("### 📊 What You'll Get")
             st.markdown("""
+            - **Business Impact-Based Severity** (% of total clicks)
             - **True Cannibalization Detection** based on click distribution
-            - **Severity Classification** (HIGH/MEDIUM/LOW)
             - **URL-based and Query-based Reports**
-            - **Number of URLs affected** metrics
+            - **Actionable Priority Rankings**
             """)
         
-        st.markdown("### 📋 Cannibalization Detection Logic")
+        st.markdown("### 📋 Refined Severity Criteria")
         st.markdown("""
-        **TRUE cannibalization is detected when:**
-        - Multiple URLs rank for the same keyword
-        - Traffic is **actually being split** between URLs (not dominated by one)
-        - At least 2 URLs have significant click distribution (above threshold)
+        **Severity is now based on business impact:**
+        - **🔴 HIGH**: Cannibalized queries represent ≥10% of total website clicks
+        - **🟡 MEDIUM**: Between 1% and 9% of total website clicks
+        - **🟣 LOW**: Less than 1% of total website clicks
         
-        **Severity Levels:**
-        - **HIGH**: 5+ URLs affected OR 20-25% distribution with 3-4 URLs
-        - **MEDIUM**: 3-4 URLs with moderate distribution
-        - **LOW**: 2 URLs with minimal distribution splitting
+        **Why this matters:**
+        - A query with 5 clicks split between URLs = LOW priority (minimal impact)
+        - A query with 15,000 clicks split between URLs = HIGH priority (major impact)
         
-        **NOT cannibalization**: One URL gets 95% of clicks, others get 0-5%
+        **Focus your efforts where it matters most for your organic traffic!**
         """)
     
     def _render_analysis_interface(self):
@@ -459,7 +460,7 @@ class StreamlitGSCAnalyzer:
             status_text.text("🔄 Analyzing keyword cannibalization...")
             progress_bar.progress(25)
             
-            # Analyze cannibalization
+            # Analyze cannibalization with refined severity logic
             results = self._analyze_cannibalization(df, config)
             progress_bar.progress(75)
             
@@ -478,7 +479,10 @@ class StreamlitGSCAnalyzer:
             logger.error(f"Analysis error: {e}")
     
     def _analyze_cannibalization(self, df: pd.DataFrame, config: AnalysisConfig) -> Dict[str, Any]:
-        """Analyze cannibalization with refined logic based on click distribution."""
+        """Analyze cannibalization with REFINED severity logic based on % of total clicks."""
+        
+        # Calculate total website clicks for severity calculation
+        total_website_clicks = df['clicks'].sum()
         
         # Group by query to analyze click distribution
         query_analysis = []
@@ -488,10 +492,10 @@ class StreamlitGSCAnalyzer:
         query_groups = df.groupby('query')
         
         for query, group in query_groups:
-            total_clicks = group['clicks'].sum()
+            total_query_clicks = group['clicks'].sum()
             
             # Only analyze queries with sufficient total clicks
-            if total_clicks < config.min_clicks:
+            if total_query_clicks < config.min_clicks:
                 continue
             
             # Calculate click distribution for each URL
@@ -501,7 +505,7 @@ class StreamlitGSCAnalyzer:
             for _, row in group.iterrows():
                 url = row['url']
                 clicks = row['clicks']
-                distribution_pct = (clicks / total_clicks) * 100 if total_clicks > 0 else 0
+                distribution_pct = (clicks / total_query_clicks) * 100 if total_query_clicks > 0 else 0
                 
                 url_distributions.append({
                     'url': url,
@@ -521,19 +525,18 @@ class StreamlitGSCAnalyzer:
                 # This is TRUE cannibalization
                 num_urls_affected = len(urls_in_query)
                 
-                # Determine severity
-                max_distribution = max(u['distribution_pct'] for u in urls_above_threshold)
-                severity = self._calculate_severity(num_urls_affected, max_distribution, 
-                                                 len(urls_above_threshold))
+                # REFINED SEVERITY: Based on % of total website clicks
+                query_impact_pct = (total_query_clicks / total_website_clicks) * 100
+                severity = self._calculate_refined_severity(query_impact_pct)
                 
                 cannibalized_queries.append({
                     'query': query,
-                    'total_clicks': int(total_clicks),
+                    'total_clicks': int(total_query_clicks),
+                    'query_impact_pct': round(query_impact_pct, 2),
                     'num_urls_affected': num_urls_affected,
                     'urls_above_threshold': len(urls_above_threshold),
                     'click_distributions': url_distributions,
-                    'severity': severity,
-                    'max_distribution_pct': max_distribution
+                    'severity': severity
                 })
                 
                 # Add URLs to affected set
@@ -542,7 +545,7 @@ class StreamlitGSCAnalyzer:
             # Add to general analysis
             query_analysis.append({
                 'query': query,
-                'total_clicks': int(total_clicks),
+                'total_clicks': int(total_query_clicks),
                 'num_urls': len(urls_in_query),
                 'click_distributions': url_distributions,
                 'is_cannibalized': len(urls_above_threshold) >= 2
@@ -554,25 +557,17 @@ class StreamlitGSCAnalyzer:
             'total_queries_analyzed': len(query_analysis),
             'total_cannibalized_queries': len(cannibalized_queries),
             'total_urls_affected': len(urls_affected),
+            'total_website_clicks': int(total_website_clicks),
             'severity_breakdown': self._calculate_severity_breakdown(cannibalized_queries)
         }
     
-    def _calculate_severity(self, num_urls: int, max_distribution: float, urls_above_threshold: int) -> str:
-        """Calculate cannibalization severity based on refined criteria."""
+    def _calculate_refined_severity(self, query_impact_pct: float) -> str:
+        """Calculate severity based on REFINED criteria: % of total website clicks."""
         
-        # HIGH severity scenarios
-        if (num_urls >= 5 and max_distribution >= 10) or \
-           (3 <= num_urls <= 4 and 20 <= max_distribution <= 25) or \
-           (num_urls >= 2 and max_distribution >= 30):
+        if query_impact_pct >= 10.0:
             return "HIGH"
-        
-        # MEDIUM severity scenarios  
-        elif (3 <= num_urls <= 4 and 15 <= max_distribution < 20) or \
-             (num_urls >= 2 and 25 <= max_distribution < 30) or \
-             (num_urls >= 5 and max_distribution < 10):
+        elif query_impact_pct >= 1.0:
             return "MEDIUM"
-        
-        # LOW severity (everything else that qualifies as cannibalization)
         else:
             return "LOW"
     
@@ -611,10 +606,11 @@ class StreamlitGSCAnalyzer:
         url_stats.columns = ['unique_queries', 'total_clicks', 'total_impressions']
         url_stats = url_stats.astype(int)
         
-        # Add cannibalization flags
+        # Add cannibalization flags based on refined severity
         cannibalized_urls = set()
         severity_flags = {}
         cannibalized_queries_count = {}
+        impact_percentages = {}
         
         for query_data in results['cannibalized_queries']:
             for url_data in query_data['click_distributions']:
@@ -622,19 +618,22 @@ class StreamlitGSCAnalyzer:
                 if url_data['distribution_pct'] >= st.session_state.analysis_config.click_distribution_threshold:
                     cannibalized_urls.add(url)
                     
-                    # Track highest severity for this URL
+                    # Track highest severity and impact for this URL
                     current_severity = severity_flags.get(url, "LOW")
                     new_severity = query_data['severity']
                     
                     if new_severity == "HIGH" or (new_severity == "MEDIUM" and current_severity == "LOW"):
                         severity_flags[url] = new_severity
                     
-                    # Count cannibalized queries
+                    # Count cannibalized queries and track impact
                     cannibalized_queries_count[url] = cannibalized_queries_count.get(url, 0) + 1
+                    current_impact = impact_percentages.get(url, 0)
+                    impact_percentages[url] = max(current_impact, query_data['query_impact_pct'])
         
         url_stats['cannibalization_flag'] = url_stats.index.map(lambda x: x in cannibalized_urls)
         url_stats['cannibalization_severity'] = url_stats.index.map(lambda x: severity_flags.get(x, "NONE"))
         url_stats['cannibalized_queries_count'] = url_stats.index.map(lambda x: cannibalized_queries_count.get(x, 0))
+        url_stats['max_query_impact_pct'] = url_stats.index.map(lambda x: round(impact_percentages.get(x, 0), 2))
         
         # Add top queries
         top_queries = (
@@ -646,7 +645,7 @@ class StreamlitGSCAnalyzer:
         return url_stats.reset_index()
     
     def _create_query_based_report(self, results: Dict[str, Any], df: pd.DataFrame) -> pd.DataFrame:
-        """Create query-based cannibalization report."""
+        """Create query-based cannibalization report with impact percentages."""
         query_report_data = []
         
         for query_data in results['cannibalized_queries']:
@@ -664,6 +663,7 @@ class StreamlitGSCAnalyzer:
                         'url': url_data['url'],
                         'clicks': url_data['clicks'],
                         'click_distribution_pct': url_data['distribution_pct'],
+                        'query_impact_pct': query_data['query_impact_pct'],
                         'impressions': int(row.get('impressions', 0)) if 'impressions' in row else 0,
                         'ctr': round(row.get('ctr', 0), 2) if 'ctr' in row else 0,
                         'position': round(row.get('position', 0), 1) if 'position' in row else 0,
@@ -674,13 +674,13 @@ class StreamlitGSCAnalyzer:
         
         if query_report_data:
             query_df = pd.DataFrame(query_report_data)
-            return query_df.sort_values(['severity', 'total_query_clicks'], 
+            return query_df.sort_values(['severity', 'query_impact_pct'], 
                                       ascending=[False, False])
         else:
-            return pd.DataFrame(columns=['query', 'url', 'clicks', 'click_distribution_pct'])
+            return pd.DataFrame(columns=['query', 'url', 'clicks', 'click_distribution_pct', 'query_impact_pct'])
     
     def _create_cannibalization_report(self, results: Dict[str, Any]) -> pd.DataFrame:
-        """Create detailed cannibalization report with actual URL names."""
+        """Create detailed cannibalization report with business impact focus."""
         cannibalization_data = []
         
         for query_data in results['cannibalized_queries']:
@@ -705,24 +705,25 @@ class StreamlitGSCAnalyzer:
                 'query': query,
                 'severity': query_data['severity'],
                 'total_clicks': query_data['total_clicks'],
+                'query_impact_pct': query_data['query_impact_pct'],
                 'num_urls_competing': len(significant_urls),
                 'competing_urls': ' | '.join(url_list),
                 'click_distribution': ' | '.join([f"{c} ({d})" for c, d in zip(click_list, distribution_list)]),
-                'max_distribution_pct': query_data['max_distribution_pct']
+                'business_impact': f"{query_data['query_impact_pct']}% of total clicks"
             })
         
         if cannibalization_data:
             cannibalization_df = pd.DataFrame(cannibalization_data)
-            return cannibalization_df.sort_values(['severity', 'total_clicks'], 
+            return cannibalization_df.sort_values(['severity', 'query_impact_pct'], 
                                                 ascending=[False, False])
         else:
-            return pd.DataFrame(columns=['query', 'severity', 'total_clicks', 'num_urls_competing'])
+            return pd.DataFrame(columns=['query', 'severity', 'total_clicks', 'query_impact_pct'])
     
     def _render_analysis_results(self):
         """Render analysis results with updated tabs."""
         results = st.session_state.analysis_results
         
-        # Create tabs (removed SERP overlap as requested)
+        # Create tabs
         tabs = st.tabs(["📊 Overview", "🌐 URL-Based Report", "🔍 Query-Based Report", "⚠️ Cannibalization Report", "📈 Visualizations"])
         
         with tabs[0]:
@@ -741,50 +742,57 @@ class StreamlitGSCAnalyzer:
             self._render_visualizations(results)
     
     def _render_overview(self, results: Dict[str, Any]):
-        """Render analysis overview with corrected metrics."""
+        """Render analysis overview with business impact focus."""
         st.markdown("## 📊 Analysis Overview")
         
-        # Key metrics with corrected logic
+        # Key metrics with business impact focus
         col1, col2, col3, col4 = st.columns(4)
         
         with col1:
-            st.metric("Total Queries Analyzed", f"{results['total_queries_analyzed']:,}")
+            st.metric("Total Website Clicks", f"{results['total_website_clicks']:,}")
         
         with col2:
-            st.metric("TRUE Cannibalization Cases", f"{results['total_cannibalized_queries']:,}")
+            st.metric("Cannibalized Queries", f"{results['total_cannibalized_queries']:,}")
         
         with col3:
             st.metric("URLs Affected", f"{results['total_urls_affected']:,}")
         
         with col4:
-            severity_breakdown = results['severity_breakdown']
-            high_severity = severity_breakdown.get('HIGH', 0)
-            st.metric("High Severity Cases", f"{high_severity:,}")
+            # Calculate total clicks affected by cannibalization
+            total_affected_clicks = sum(q['total_clicks'] for q in results['cannibalized_queries'])
+            affected_pct = (total_affected_clicks / results['total_website_clicks']) * 100 if results['total_website_clicks'] > 0 else 0
+            st.metric("Total Traffic at Risk", f"{affected_pct:.1f}%")
         
-        # Severity breakdown
-        st.markdown("### 🎯 Severity Breakdown")
+        # Severity breakdown with business impact
+        st.markdown("### 🎯 Business Impact Breakdown")
         severity_breakdown = results['severity_breakdown']
         
         col1, col2, col3 = st.columns(3)
         
         with col1:
             st.markdown('<div class="high-severity">', unsafe_allow_html=True)
-            st.metric("🔴 HIGH Severity", f"{severity_breakdown.get('HIGH', 0):,}")
+            high_count = severity_breakdown.get('HIGH', 0)
+            st.metric("🔴 HIGH Priority", f"{high_count:,}")
+            st.markdown("*≥10% of total clicks*")
             st.markdown("</div>", unsafe_allow_html=True)
         
         with col2:
             st.markdown('<div class="medium-severity">', unsafe_allow_html=True)
-            st.metric("🟡 MEDIUM Severity", f"{severity_breakdown.get('MEDIUM', 0):,}")
+            medium_count = severity_breakdown.get('MEDIUM', 0)
+            st.metric("🟡 MEDIUM Priority", f"{medium_count:,}")
+            st.markdown("*1-9% of total clicks*")
             st.markdown("</div>", unsafe_allow_html=True)
         
         with col3:
             st.markdown('<div class="low-severity">', unsafe_allow_html=True)
-            st.metric("🟣 LOW Severity", f"{severity_breakdown.get('LOW', 0):,}")
+            low_count = severity_breakdown.get('LOW', 0)
+            st.metric("🟣 LOW Priority", f"{low_count:,}")
+            st.markdown("*<1% of total clicks*")
             st.markdown("</div>", unsafe_allow_html=True)
         
-        # Key insights
-        st.markdown("### 🎯 Key Insights")
-        insights = self._generate_insights(results)
+        # Key insights with business focus
+        st.markdown("### 🎯 Key Business Insights")
+        insights = self._generate_business_insights(results)
         for insight in insights:
             st.markdown(f"• {insight}")
     
@@ -809,9 +817,9 @@ class StreamlitGSCAnalyzer:
             st.info("No URL-based report data available")
     
     def _render_query_report(self, results: Dict[str, Any]):
-        """Render Query-based report (now properly implemented)."""
+        """Render Query-based report with business impact focus."""
         st.markdown("## 🔍 Query-Based Report")
-        st.markdown("**Shows each cannibalized query with detailed metrics for every competing URL.**")
+        st.markdown("**Shows each cannibalized query with business impact (% of total clicks) and detailed metrics.**")
         
         reports = results.get('reports', {})
         query_report = reports.get('query_based')
@@ -822,7 +830,7 @@ class StreamlitGSCAnalyzer:
             
             with col1:
                 severity_filter = st.selectbox(
-                    "Filter by Severity",
+                    "Filter by Business Priority",
                     ["All", "HIGH", "MEDIUM", "LOW"],
                     index=0
                 )
@@ -856,9 +864,9 @@ class StreamlitGSCAnalyzer:
             st.success("🎉 No query-level cannibalization detected!")
     
     def _render_cannibalization_report(self, results: Dict[str, Any]):
-        """Render detailed cannibalization report with actual URLs."""
-        st.markdown("## ⚠️ Cannibalization Report")
-        st.markdown("**Detailed view of each cannibalized query with competing URLs and click distributions.**")
+        """Render detailed cannibalization report with business impact."""
+        st.markdown("## ⚠️ Business Impact Cannibalization Report")
+        st.markdown("**Prioritized by business impact - queries affecting the highest % of your total clicks.**")
         
         reports = results.get('reports', {})
         cannibalization_report = reports.get('cannibalization')
@@ -877,72 +885,93 @@ class StreamlitGSCAnalyzer:
             st.success("🎉 No cannibalization detected! Your URLs have proper keyword ownership.")
     
     def _render_visualizations(self, results: Dict[str, Any]):
-        """Render data visualizations."""
-        st.markdown("## 📈 Visualizations")
+        """Render data visualizations with business impact focus."""
+        st.markdown("## 📈 Business Impact Visualizations")
         
         cannibalized_queries = results.get('cannibalized_queries', [])
         
         if cannibalized_queries:
-            # Severity distribution
+            # Business impact by severity
             severity_counts = results.get('severity_breakdown', {})
             
             fig_severity = px.pie(
                 values=list(severity_counts.values()),
                 names=list(severity_counts.keys()),
-                title="Cannibalization by Severity Level",
+                title="Cannibalization Cases by Business Priority",
                 color_discrete_map={'HIGH': '#f44336', 'MEDIUM': '#ff9800', 'LOW': '#9c27b0'}
             )
             st.plotly_chart(fig_severity, use_container_width=True)
             
-            # Click distribution histogram
-            max_distributions = [q['max_distribution_pct'] for q in cannibalized_queries]
+            # Business impact distribution (% of total clicks)
+            impact_percentages = [q['query_impact_pct'] for q in cannibalized_queries]
             
-            fig_dist = px.histogram(
-                x=max_distributions,
+            fig_impact = px.histogram(
+                x=impact_percentages,
                 nbins=20,
-                title="Distribution of Maximum Click Percentages in Cannibalized Queries",
-                labels={'x': 'Maximum Click Distribution %', 'y': 'Number of Queries'}
+                title="Distribution of Business Impact (% of Total Website Clicks)",
+                labels={'x': '% of Total Website Clicks', 'y': 'Number of Cannibalized Queries'}
             )
-            st.plotly_chart(fig_dist, use_container_width=True)
+            fig_impact.add_vline(x=10, line_dash="dash", line_color="red", 
+                               annotation_text="HIGH Priority (10%+)")
+            fig_impact.add_vline(x=1, line_dash="dash", line_color="orange", 
+                               annotation_text="MEDIUM Priority (1%+)")
+            st.plotly_chart(fig_impact, use_container_width=True)
             
-            # Number of competing URLs
-            num_urls = [q['num_urls_affected'] for q in cannibalized_queries]
+            # Click volume vs impact scatter plot
+            clicks_data = [q['total_clicks'] for q in cannibalized_queries]
+            impact_data = [q['query_impact_pct'] for q in cannibalized_queries]
+            severity_data = [q['severity'] for q in cannibalized_queries]
             
-            fig_urls = px.histogram(
-                x=num_urls,
-                nbins=10,
-                title="Number of Competing URLs per Cannibalized Query",
-                labels={'x': 'Number of Competing URLs', 'y': 'Number of Queries'}
+            fig_scatter = px.scatter(
+                x=clicks_data,
+                y=impact_data,
+                color=severity_data,
+                title="Click Volume vs Business Impact",
+                labels={'x': 'Total Query Clicks', 'y': '% of Total Website Clicks'},
+                color_discrete_map={'HIGH': '#f44336', 'MEDIUM': '#ff9800', 'LOW': '#9c27b0'}
             )
-            st.plotly_chart(fig_urls, use_container_width=True)
+            st.plotly_chart(fig_scatter, use_container_width=True)
         else:
             st.info("No cannibalization data available for visualization.")
     
-    def _generate_insights(self, results: Dict[str, Any]) -> List[str]:
-        """Generate actionable insights."""
+    def _generate_business_insights(self, results: Dict[str, Any]) -> List[str]:
+        """Generate business-focused actionable insights."""
         insights = []
         
         total_cannibalized = results['total_cannibalized_queries']
         total_urls_affected = results['total_urls_affected']
+        total_website_clicks = results['total_website_clicks']
         severity_breakdown = results['severity_breakdown']
+        cannibalized_queries = results.get('cannibalized_queries', [])
         
         if total_cannibalized > 0:
-            insights.append(f"🚨 Found {total_cannibalized} queries with TRUE cannibalization affecting {total_urls_affected} URLs")
+            # Calculate total traffic at risk
+            total_affected_clicks = sum(q['total_clicks'] for q in cannibalized_queries)
+            affected_pct = (total_affected_clicks / total_website_clicks) * 100
+            
+            insights.append(f"🚨 {affected_pct:.1f}% of your total organic traffic ({total_affected_clicks:,} clicks) is affected by cannibalization")
             
             high_severity = severity_breakdown.get('HIGH', 0)
             if high_severity > 0:
-                insights.append(f"⚠️ {high_severity} queries have HIGH severity cannibalization - immediate attention required")
+                high_traffic_queries = [q for q in cannibalized_queries if q['severity'] == 'HIGH']
+                high_traffic_clicks = sum(q['total_clicks'] for q in high_traffic_queries)
+                high_impact_pct = (high_traffic_clicks / total_website_clicks) * 100
+                insights.append(f"🔴 HIGH PRIORITY: {high_severity} queries affecting {high_impact_pct:.1f}% of your traffic - fix these first!")
             
             medium_severity = severity_breakdown.get('MEDIUM', 0)
             if medium_severity > 0:
-                insights.append(f"📊 {medium_severity} queries have MEDIUM severity - consider consolidation strategies")
+                insights.append(f"🟡 MEDIUM PRIORITY: {medium_severity} queries with moderate business impact - consider for next optimization cycle")
             
-            # Calculate average URLs affected
-            if results.get('cannibalized_queries'):
-                avg_urls = sum(q['num_urls_affected'] for q in results['cannibalized_queries']) / len(results['cannibalized_queries'])
-                insights.append(f"📈 Average {avg_urls:.1f} URLs competing per cannibalized query")
+            low_severity = severity_breakdown.get('LOW', 0)
+            if low_severity > 0:
+                insights.append(f"🟣 LOW PRIORITY: {low_severity} queries with minimal impact - monitor but not urgent")
+            
+            # Find the highest impact single query
+            if cannibalized_queries:
+                highest_impact_query = max(cannibalized_queries, key=lambda x: x['query_impact_pct'])
+                insights.append(f"🎯 Most critical query: '{highest_impact_query['query'][:50]}...' affects {highest_impact_query['query_impact_pct']:.1f}% of your traffic")
         else:
-            insights.append("✅ No true cannibalization detected - excellent keyword ownership structure!")
+            insights.append("✅ No cannibalization detected - excellent keyword ownership structure! Your URLs aren't competing with each other.")
         
         return insights
     
