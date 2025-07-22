@@ -1,9 +1,9 @@
 """
-GSC Performance & SERP Overlap Analyzer
-Complete Streamlit Application with Enhanced CSV Processing
+GSC Keyword Cannibalization Analyzer
+Enterprise-grade application for detecting true keyword cannibalization issues
 
-Enterprise-grade application for analyzing Google Search Console data
-and conducting SERP overlap analysis using Serper API.
+Focuses specifically on identifying cases where multiple URLs are splitting traffic
+for the same queries, indicating genuine cannibalization problems.
 """
 
 import streamlit as st
@@ -12,10 +12,6 @@ import numpy as np
 import plotly.express as px
 import plotly.graph_objects as go
 from plotly.subplots import make_subplots
-import requests
-import time
-from datetime import datetime
-import json
 import tempfile
 import os
 import csv
@@ -23,9 +19,8 @@ import chardet
 from typing import Dict, List, Tuple, Optional, Any
 from dataclasses import dataclass
 from itertools import combinations
-import concurrent.futures
-from concurrent.futures import ThreadPoolExecutor
 import logging
+from datetime import datetime
 
 # Configure logging
 logging.basicConfig(level=logging.INFO)
@@ -33,7 +28,7 @@ logger = logging.getLogger(__name__)
 
 # Page Configuration
 st.set_page_config(
-    page_title="GSC Performance & SERP Overlap Analyzer",
+    page_title="GSC Keyword Cannibalization Analyzer",
     page_icon="🔍",
     layout="wide",
     initial_sidebar_state="expanded"
@@ -54,32 +49,32 @@ st.markdown("""
         border-radius: 0.5rem;
         border-left: 4px solid #1f77b4;
     }
-    .warning-box {
-        background-color: #fff3cd;
-        border: 1px solid #ffeaa7;
-        border-radius: 0.5rem;
+    .high-severity {
+        background-color: #ffebee;
+        border-left: 4px solid #f44336;
         padding: 1rem;
-        margin: 1rem 0;
+        border-radius: 0.5rem;
     }
-    .success-box {
-        background-color: #d4edda;
-        border: 1px solid #c3e6cb;
-        border-radius: 0.5rem;
+    .medium-severity {
+        background-color: #fff3e0;
+        border-left: 4px solid #ff9800;
         padding: 1rem;
-        margin: 1rem 0;
+        border-radius: 0.5rem;
+    }
+    .low-severity {
+        background-color: #f3e5f5;
+        border-left: 4px solid #9c27b0;
+        padding: 1rem;
+        border-radius: 0.5rem;
     }
 </style>
 """, unsafe_allow_html=True)
 
 @dataclass
 class AnalysisConfig:
-    """Configuration for the overlap analysis."""
+    """Configuration for the cannibalization analysis."""
     min_clicks: int = 1
-    serp_overlap_threshold: float = 50.0
-    api_delay: float = 1.0
-    batch_size: int = 10
-    cannibalization_threshold: int = 10  # Minimum clicks for cannibalization detection
-    click_similarity_ratio: float = 0.5  # URLs must have at least 50% similar clicks for same keyword
+    click_distribution_threshold: float = 10.0  # Minimum % for cannibalization detection
 
 class EnhancedCSVProcessor:
     """Enhanced CSV processor with automatic delimiter detection and flexible column mapping."""
@@ -123,8 +118,6 @@ class EnhancedCSVProcessor:
         except Exception as e:
             logger.error(f"Delimiter detection error: {e}")
         
-        # Default fallback
-        logger.warning("Using default comma delimiter")
         return ','
     
     def _frequency_based_detection(self, sample: str) -> Optional[str]:
@@ -179,27 +172,21 @@ class EnhancedCSVProcessor:
     def create_column_mapping(self, csv_columns: List[str]) -> Dict[str, str]:
         """Create flexible column mapping from CSV columns to standard names."""
         column_mapping = {}
-        mapped_types = set()
-        
-        # Normalize column names
         normalized_columns = {
             col.lower().strip().replace('_', ' '): col 
             for col in csv_columns
         }
         
-        # Try to match each column type
         for col_type, variations in self.column_variations.items():
             matched_column = None
             
             for variation in variations:
                 normalized_variation = variation.lower().strip()
                 
-                # Direct match
                 if normalized_variation in normalized_columns:
                     matched_column = normalized_columns[normalized_variation]
                     break
                 
-                # Partial match
                 for norm_csv_col, original_csv_col in normalized_columns.items():
                     if (normalized_variation in norm_csv_col or 
                         norm_csv_col in normalized_variation):
@@ -211,7 +198,6 @@ class EnhancedCSVProcessor:
             
             if matched_column:
                 column_mapping[matched_column] = col_type
-                mapped_types.add(col_type)
                 logger.debug(f"Mapped: {matched_column} -> {col_type}")
         
         return column_mapping
@@ -219,11 +205,11 @@ class EnhancedCSVProcessor:
     def process_gsc_data(self, file_path: str) -> pd.DataFrame:
         """Process GSC CSV data with automatic delimiter detection and column mapping."""
         try:
-            # Step 1: Detect delimiter and encoding
+            # Detect delimiter and encoding
             delimiter = self.detect_delimiter(file_path)
             encoding = self.detect_encoding(file_path)
             
-            # Step 2: Load CSV
+            # Load CSV
             df = pd.read_csv(
                 file_path,
                 sep=delimiter,
@@ -233,12 +219,11 @@ class EnhancedCSVProcessor:
             )
             
             logger.info(f"Loaded CSV with shape: {df.shape}")
-            logger.info(f"Original columns: {list(df.columns)}")
             
-            # Step 3: Create column mapping
+            # Create column mapping
             column_mapping = self.create_column_mapping(df.columns)
             
-            # Check if required columns are mapped
+            # Check required columns
             required_cols = ['query', 'url', 'clicks']
             missing_required = set(required_cols) - set(column_mapping.values())
             
@@ -257,36 +242,35 @@ class EnhancedCSVProcessor:
                 )
                 raise ValueError(error_msg)
             
-            # Step 4: Apply mapping and clean data
+            # Apply mapping and clean data
             df_mapped = df[list(column_mapping.keys())].rename(columns=column_mapping)
-            
-            # Data cleaning
             df_clean = df_mapped.dropna(subset=required_cols)
             
-            # Convert numeric columns
+            # Convert numeric columns and remove decimals for display
             numeric_columns = ['clicks', 'impressions', 'ctr', 'position']
             for col in numeric_columns:
                 if col in df_clean.columns:
                     df_clean[col] = pd.to_numeric(df_clean[col], errors='coerce')
+                    # Remove decimals from clicks and impressions as requested
+                    if col in ['clicks', 'impressions']:
+                        df_clean[col] = df_clean[col].fillna(0).astype(int)
             
-            # Remove rows with 0 clicks
+            # Remove zero-click rows
             if 'clicks' in df_clean.columns:
                 initial_count = len(df_clean)
                 df_clean = df_clean[df_clean['clicks'] > 0]
                 removed_count = initial_count - len(df_clean)
-                
                 if removed_count > 0:
-                    logger.info(f"Removed {removed_count} rows with 0 or negative clicks")
+                    logger.info(f"Removed {removed_count} rows with 0 clicks")
             
             # Clean text columns
-            text_columns = ['url', 'query']
-            for col in text_columns:
+            for col in ['url', 'query']:
                 if col in df_clean.columns:
                     df_clean[col] = df_clean[col].astype(str).str.strip()
                     df_clean = df_clean[df_clean[col] != '']
             
             if len(df_clean) == 0:
-                raise ValueError("No valid data remaining after cleaning and validation")
+                raise ValueError("No valid data remaining after cleaning")
             
             logger.info(f"Data processing complete. Final dataset: {len(df_clean):,} rows")
             return df_clean
@@ -296,37 +280,8 @@ class EnhancedCSVProcessor:
             logger.error(error_msg)
             raise ValueError(error_msg)
 
-class SerpAPIClient:
-    """SERP API client for search result analysis."""
-    
-    def __init__(self, api_key: str):
-        self.api_key = api_key
-        self.base_url = "https://google.serper.dev/search"
-    
-    def search(self, query: str, num_results: int = 10) -> Dict[str, Any]:
-        """Perform search and return results."""
-        try:
-            headers = {
-                'X-API-KEY': self.api_key,
-                'Content-Type': 'application/json'
-            }
-            
-            payload = {
-                'q': query,
-                'num': num_results
-            }
-            
-            response = requests.post(self.base_url, headers=headers, json=payload)
-            response.raise_for_status()
-            
-            return response.json()
-            
-        except Exception as e:
-            logger.error(f"SERP API error for query '{query}': {e}")
-            return {}
-
 class StreamlitGSCAnalyzer:
-    """Main Streamlit application class for GSC Performance & SERP Overlap Analysis."""
+    """Main Streamlit application class for GSC Keyword Cannibalization Analysis."""
     
     def __init__(self):
         """Initialize the application."""
@@ -339,33 +294,25 @@ class StreamlitGSCAnalyzer:
             st.session_state.gsc_data = None
         if 'analysis_config' not in st.session_state:
             st.session_state.analysis_config = AnalysisConfig()
-        if 'serp_api_client' not in st.session_state:
-            st.session_state.serp_api_client = None
         if 'analysis_results' not in st.session_state:
             st.session_state.analysis_results = None
-        if 'analysis_progress' not in st.session_state:
-            st.session_state.analysis_progress = 0
     
     def render_header(self):
         """Render the main application header."""
-        st.markdown('<h1 class="main-header">🔍 GSC Performance & SERP Overlap Analyzer</h1>', 
+        st.markdown('<h1 class="main-header">🔍 GSC Keyword Cannibalization Analyzer</h1>', 
                    unsafe_allow_html=True)
         st.markdown("""
-        **Identify keyword cannibalization issues through advanced overlap analysis**
+        **Identify TRUE keyword cannibalization issues through click distribution analysis**
         
-        This tool analyzes Google Search Console data and conducts SERP overlap 
-        analysis to identify potential cannibalization issues between your URLs.
+        This tool analyzes Google Search Console data to identify cases where multiple URLs 
+        are actually splitting traffic for the same queries, indicating real cannibalization problems.
         """)
     
     def render_sidebar(self):
-        """Render the sidebar with updated layout - API first, then data upload."""
+        """Render the sidebar with configuration options."""
         st.sidebar.title("⚙️ Configuration")
         
-        # API Configuration (moved to top as requested)
-        st.sidebar.subheader("🔑 API Configuration")
-        self._render_api_config()
-        
-        # File Upload Section (below API config as requested)
+        # File Upload Section
         st.sidebar.subheader("📁 Data Upload")
         self._render_file_upload()
         
@@ -374,7 +321,7 @@ class StreamlitGSCAnalyzer:
         self._render_analysis_parameters()
     
     def _render_file_upload(self):
-        """Render the enhanced file upload section."""
+        """Render the file upload section."""
         uploaded_file = st.sidebar.file_uploader(
             "Upload GSC Performance CSV",
             type=['csv'],
@@ -395,108 +342,48 @@ class StreamlitGSCAnalyzer:
                 st.write(f"**Queries:** {df['query'].nunique():,}")
                 st.write(f"**Total Clicks:** {df['clicks'].sum():,}")
     
-    def _render_api_config(self):
-        """Render API configuration section."""
-        serp_api_key = st.sidebar.text_input(
-            "Serper API Key",
-            type="password",
-            help="Get your API key from serper.dev",
-            value=""
-        )
-        
-        if serp_api_key:
-            if st.sidebar.button("Validate API Key"):
-                self._validate_api_key(serp_api_key)
-            
-            if serp_api_key != "":
-                st.session_state.serp_api_client = SerpAPIClient(api_key=serp_api_key)
-    
     def _render_analysis_parameters(self):
-        """Render analysis parameters section with cannibalization settings."""
+        """Render analysis parameters section."""
         config = st.session_state.analysis_config
         
         config.min_clicks = st.sidebar.number_input(
-            "Minimum Clicks",
-            min_value=0,
+            "Minimum Total Clicks per Query",
+            min_value=1,
             max_value=100,
             value=config.min_clicks,
-            help="Minimum clicks required for SERP analysis"
+            help="Minimum clicks required across all URLs for a query to be analyzed"
         )
         
-        config.serp_overlap_threshold = st.sidebar.slider(
-            "SERP Overlap Threshold (%)",
-            min_value=0.0,
-            max_value=100.0,
-            value=config.serp_overlap_threshold,
-            step=5.0,
-            help="Threshold for high SERP overlap classification"
+        config.click_distribution_threshold = st.sidebar.slider(
+            "Click Distribution Threshold (%)",
+            min_value=5.0,
+            max_value=50.0,
+            value=config.click_distribution_threshold,
+            step=1.0,
+            help="Minimum click percentage for a URL to be considered in cannibalization (10% = at least 2 URLs must have 10%+ of clicks each)"
         )
         
-        config.cannibalization_threshold = st.sidebar.number_input(
-            "Cannibalization Min Clicks",
-            min_value=5,
-            max_value=100,
-            value=config.cannibalization_threshold,
-            help="Minimum clicks required to detect cannibalization"
-        )
-        
-        config.click_similarity_ratio = st.sidebar.slider(
-            "Click Similarity Ratio",
-            min_value=0.3,
-            max_value=1.0,
-            value=config.click_similarity_ratio,
-            step=0.1,
-            help="URLs must have similar click volumes (0.5 = within 50% of each other)"
-        )
-        
-        config.api_delay = st.sidebar.slider(
-            "API Delay (seconds)",
-            min_value=0.5,
-            max_value=5.0,
-            value=config.api_delay,
-            step=0.5,
-            help="Delay between API calls to avoid rate limiting"
-        )
-        
-        # Show actual query count
+        # Show query count
         if st.session_state.gsc_data is not None:
             df = st.session_state.gsc_data
             eligible_queries = len(df[df['clicks'] >= config.min_clicks])
             st.sidebar.info(f"📊 Queries to analyze: {eligible_queries:,}")
     
     def _process_uploaded_file(self, uploaded_file):
-        """Process the uploaded GSC CSV file with enhanced error handling."""
+        """Process the uploaded GSC CSV file."""
         try:
-            # Create temporary file
             with tempfile.NamedTemporaryFile(delete=False, suffix='.csv') as tmp_file:
                 tmp_file.write(uploaded_file.getbuffer())
                 temp_path = tmp_file.name
             
-            # Process the data using enhanced CSV processor
             df = self.csv_processor.process_gsc_data(temp_path)
             st.session_state.gsc_data = df
             
-            # Clean up temp file
             os.unlink(temp_path)
-            
             st.sidebar.success("✅ File processed successfully!")
             
         except Exception as e:
             st.sidebar.error(f"❌ Processing error: {str(e)}")
-    
-    def _validate_api_key(self, api_key):
-        """Validate the Serper API key."""
-        try:
-            client = SerpAPIClient(api_key=api_key)
-            test_result = client.search("test query", num_results=1)
-            
-            if test_result:
-                st.sidebar.success("✅ API key validated!")
-            else:
-                st.sidebar.error("❌ API key validation failed")
-                
-        except Exception as e:
-            st.sidebar.error(f"❌ API validation error: {str(e)}")
     
     def render_main_content(self):
         """Render the main content area."""
@@ -514,445 +401,328 @@ class StreamlitGSCAnalyzer:
         with col1:
             st.markdown("### 🚀 Getting Started")
             st.markdown("""
-            1. **Enter your Serper API key** in the sidebar
-            2. **Upload your GSC data** in the sidebar
-            3. **Click Process File**
-            4. **Configure analysis parameters**
-            5. **Run the analysis**
+            1. **Upload your GSC data** in the sidebar
+            2. **Configure analysis parameters**
+            3. **Run the analysis**
             """)
         
         with col2:
             st.markdown("### 📊 What You'll Get")
             st.markdown("""
-            - **True Cannibalization Detection** based on click volume similarity
-            - **SERP Overlap Analysis** using live data
-            - **URL-based Reports** for high-level insights
-            - **Query-based Reports** for detailed analysis
+            - **True Cannibalization Detection** based on click distribution
+            - **Severity Classification** (HIGH/MEDIUM/LOW)
+            - **URL-based and Query-based Reports**
+            - **Number of URLs affected** metrics
             """)
         
         st.markdown("### 📋 Cannibalization Detection Logic")
         st.markdown("""
-        The app identifies **true cannibalization** when:
-        - **Multiple URLs** rank for the same keyword
-        - **Both URLs receive substantial clicks** (above minimum threshold)
-        - **Click volumes are similar** between URLs (indicating traffic splitting)
+        **TRUE cannibalization is detected when:**
+        - Multiple URLs rank for the same keyword
+        - Traffic is **actually being split** between URLs (not dominated by one)
+        - At least 2 URLs have significant click distribution (above threshold)
         
-        **Example**: URL A gets 500 clicks, URL B gets 400 clicks for the same keyword → **Cannibalization detected**
-        **Not cannibalization**: URL A gets 21 clicks, URL B gets 1 click → **Proper keyword ownership**
+        **Severity Levels:**
+        - **HIGH**: 5+ URLs affected OR 20-25% distribution with 3-4 URLs
+        - **MEDIUM**: 3-4 URLs with moderate distribution
+        - **LOW**: 2 URLs with minimal distribution splitting
+        
+        **NOT cannibalization**: One URL gets 95% of clicks, others get 0-5%
         """)
     
     def _render_analysis_interface(self):
         """Render the main analysis interface."""
-        # Analysis controls
-        col1, col2, col3 = st.columns([2, 2, 1])
+        col1, col2 = st.columns([3, 1])
         
         with col1:
-            analysis_type = st.selectbox(
-                "Analysis Type",
-                ["Full Analysis (Query + SERP Overlap)", "Query Overlap Only", "SERP Overlap Only"],
-                help="Choose the type of analysis to perform"
-            )
+            run_analysis = st.button("🚀 Start Cannibalization Analysis", type="primary")
         
         with col2:
-            if st.session_state.serp_api_client is None and "SERP" in analysis_type:
-                st.error("❌ SERP analysis requires a valid API key")
-                run_analysis = False
-            else:
-                run_analysis = st.button("🚀 Start Analysis", type="primary")
-        
-        with col3:
             if st.button("🔄 Reset"):
                 self._reset_analysis()
         
-        # Run analysis
         if run_analysis:
-            self._run_analysis(analysis_type)
+            self._run_analysis()
         
-        # Show results if available
         if st.session_state.analysis_results is not None:
             self._render_analysis_results()
     
-    def _run_analysis(self, analysis_type: str):
-        """Run the selected analysis type with enhanced progress tracking."""
+    def _run_analysis(self):
+        """Run the cannibalization analysis."""
         df = st.session_state.gsc_data
         config = st.session_state.analysis_config
         
-        # Prepare progress tracking
         progress_bar = st.progress(0)
         status_text = st.empty()
         
         try:
-            results = {}
+            status_text.text("🔄 Analyzing keyword cannibalization...")
+            progress_bar.progress(25)
             
-            # Query Overlap Analysis
-            if "Query" in analysis_type:
-                status_text.text("🔄 Running query overlap analysis...")
-                progress_bar.progress(25)
-                
-                query_results = self._analyze_query_overlaps(df, config)
-                results['query_overlap'] = query_results
-                
-                progress_bar.progress(50)
+            # Analyze cannibalization
+            results = self._analyze_cannibalization(df, config)
+            progress_bar.progress(75)
             
-            # SERP Overlap Analysis  
-            if "SERP" in analysis_type:
-                status_text.text("🔄 Running SERP overlap analysis...")
-                
-                serp_results = self._analyze_serp_overlaps(df, config, progress_bar, status_text)
-                results['serp_overlap'] = serp_results
-            
-            # Generate Reports
+            # Generate reports
             status_text.text("📊 Generating reports...")
-            progress_bar.progress(90)
-            
-            reports = self._generate_reports(results, config)
+            reports = self._generate_reports(results, df)
             results['reports'] = reports
-            
-            # Store results
-            st.session_state.analysis_results = results
-            
             progress_bar.progress(100)
-            status_text.text("✅ Analysis complete!")
             
-            st.success("🎉 Analysis completed successfully! Check the results below.")
+            st.session_state.analysis_results = results
+            status_text.text("✅ Analysis complete!")
+            st.success("🎉 Analysis completed successfully!")
             
         except Exception as e:
             st.error(f"❌ Analysis failed: {str(e)}")
             logger.error(f"Analysis error: {e}")
     
-    def _analyze_query_overlaps(self, df: pd.DataFrame, config: AnalysisConfig) -> Dict[str, Any]:
-        """Analyze query overlaps with CORRECTED cannibalization detection logic."""
-        # Group queries by URL with click data
-        url_queries = {}
-        for _, row in df.iterrows():
-            url = row['url']
-            query = row['query']
-            clicks = row['clicks']
+    def _analyze_cannibalization(self, df: pd.DataFrame, config: AnalysisConfig) -> Dict[str, Any]:
+        """Analyze cannibalization with refined logic based on click distribution."""
+        
+        # Group by query to analyze click distribution
+        query_analysis = []
+        cannibalized_queries = []
+        urls_affected = set()
+        
+        query_groups = df.groupby('query')
+        
+        for query, group in query_groups:
+            total_clicks = group['clicks'].sum()
             
-            if url not in url_queries:
-                url_queries[url] = {}
-            url_queries[url][query] = clicks
-        
-        # Calculate overlaps with CORRECTED cannibalization logic
-        overlaps = []
-        cannibalized_queries = []  # Track queries showing true cannibalization
-        url_pairs = list(combinations(url_queries.keys(), 2))
-        
-        for url1, url2 in url_pairs:
-            queries1 = set(url_queries[url1].keys())
-            queries2 = set(url_queries[url2].keys())
-            
-            intersection = queries1.intersection(queries2)
-            
-            if len(intersection) > 0:
-                # Traditional overlap percentages (for reference)
-                overlap_1_to_2 = len(intersection) / len(queries1) * 100
-                overlap_2_to_1 = len(intersection) / len(queries2) * 100
-                
-                # CORRECTED: Check for actual cannibalization by comparing click volumes
-                true_cannibalization_count = 0
-                cannibalized_queries_pair = []
-                
-                for query in intersection:
-                    clicks_url1 = url_queries[url1][query]
-                    clicks_url2 = url_queries[url2][query]
-                    
-                    # Only consider queries with sufficient clicks
-                    if clicks_url1 >= config.cannibalization_threshold or clicks_url2 >= config.cannibalization_threshold:
-                        # Check if clicks are similar (indicating traffic splitting)
-                        max_clicks = max(clicks_url1, clicks_url2)
-                        min_clicks = min(clicks_url1, clicks_url2)
-                        
-                        if max_clicks > 0:
-                            similarity_ratio = min_clicks / max_clicks
-                            
-                            # If similarity ratio is above threshold, it's cannibalization
-                            if similarity_ratio >= config.click_similarity_ratio:
-                                true_cannibalization_count += 1
-                                cannibalized_queries_pair.append({
-                                    'query': query,
-                                    'url1_clicks': clicks_url1,
-                                    'url2_clicks': clicks_url2,
-                                    'similarity_ratio': similarity_ratio
-                                })
-                
-                # Add to cannibalized queries list
-                cannibalized_queries.extend(cannibalized_queries_pair)
-                
-                # Calculate click shares for traditional metrics
-                shared_clicks_url1 = sum(url_queries[url1][query] for query in intersection)
-                shared_clicks_url2 = sum(url_queries[url2][query] for query in intersection)
-                
-                total_clicks_url1 = sum(url_queries[url1].values())
-                total_clicks_url2 = sum(url_queries[url2].values())
-                
-                click_share_url1 = (shared_clicks_url1 / total_clicks_url1) * 100 if total_clicks_url1 > 0 else 0
-                click_share_url2 = (shared_clicks_url2 / total_clicks_url2) * 100 if total_clicks_url2 > 0 else 0
-                
-                overlaps.append({
-                    'url1': url1,
-                    'url2': url2,
-                    'shared_queries': len(intersection),
-                    'url1_overlap_pct': round(overlap_1_to_2, 2),
-                    'url2_overlap_pct': round(overlap_2_to_1, 2),
-                    'url1_click_share_pct': round(click_share_url1, 2),
-                    'url2_click_share_pct': round(click_share_url2, 2),
-                    'shared_clicks_url1': shared_clicks_url1,
-                    'shared_clicks_url2': shared_clicks_url2,
-                    'true_cannibalization_count': true_cannibalization_count,
-                    'cannibalized_queries': cannibalized_queries_pair,
-                    'shared_query_list': list(intersection)
-                })
-        
-        return {
-            'url_queries': url_queries,
-            'overlaps': overlaps,
-            'cannibalized_queries': cannibalized_queries
-        }
-    
-    def _analyze_serp_overlaps(self, df: pd.DataFrame, config: AnalysisConfig, progress_bar, status_text) -> Dict[str, Any]:
-        """Analyze SERP overlaps between queries with NO artificial limits."""
-        # Filter queries with minimum clicks
-        query_df = df[df['clicks'] >= config.min_clicks].copy()
-        
-        # Get ALL unique queries (no limit) - sort by clicks for better progress tracking
-        top_queries = query_df.sort_values('clicks', ascending=False)['query'].unique()
-        
-        # Get SERP data
-        serp_data = {}
-        api_client = st.session_state.serp_api_client
-        
-        total_queries = len(top_queries)
-        st.info(f"🔍 Analyzing SERP data for {total_queries:,} queries. This may take several minutes...")
-        
-        for i, query in enumerate(top_queries):
-            try:
-                status_text.text(f"🔍 Analyzing SERP for: {query[:50]}... ({i+1:,}/{total_queries:,})")
-                
-                # Get SERP results
-                serp_results = api_client.search(query, num_results=10)
-                
-                if serp_results and 'organic' in serp_results:
-                    domains = [result.get('link', '') for result in serp_results['organic']]
-                    serp_data[query] = domains
-                
-                # Update progress
-                progress = 50 + (i / total_queries) * 40
-                progress_bar.progress(int(progress))
-                
-                # Rate limiting
-                time.sleep(config.api_delay)
-                
-            except Exception as e:
-                logger.warning(f"SERP analysis failed for query '{query}': {e}")
+            # Only analyze queries with sufficient total clicks
+            if total_clicks < config.min_clicks:
                 continue
-        
-        # Calculate SERP overlaps using Jaccard similarity
-        serp_overlaps = []
-        query_pairs = list(combinations(serp_data.keys(), 2))
-        
-        for query1, query2 in query_pairs:
-            if query1 in serp_data and query2 in serp_data:
-                serp1 = set(serp_data[query1])
-                serp2 = set(serp_data[query2])
+            
+            # Calculate click distribution for each URL
+            url_distributions = []
+            urls_in_query = []
+            
+            for _, row in group.iterrows():
+                url = row['url']
+                clicks = row['clicks']
+                distribution_pct = (clicks / total_clicks) * 100 if total_clicks > 0 else 0
                 
-                intersection = serp1.intersection(serp2)
-                union = serp1.union(serp2)
+                url_distributions.append({
+                    'url': url,
+                    'clicks': int(clicks),
+                    'distribution_pct': round(distribution_pct, 1)
+                })
+                urls_in_query.append(url)
+            
+            # Sort by clicks descending
+            url_distributions.sort(key=lambda x: x['clicks'], reverse=True)
+            
+            # Check for cannibalization: at least 2 URLs with significant distribution
+            urls_above_threshold = [u for u in url_distributions 
+                                  if u['distribution_pct'] >= config.click_distribution_threshold]
+            
+            if len(urls_above_threshold) >= 2:
+                # This is TRUE cannibalization
+                num_urls_affected = len(urls_in_query)
                 
-                if len(union) > 0:
-                    jaccard_similarity = len(intersection) / len(union) * 100
-                    
-                    if jaccard_similarity >= 10:
-                        serp_overlaps.append({
-                            'query1': query1,
-                            'query2': query2,
-                            'serp_overlap_pct': jaccard_similarity,
-                            'shared_domains': list(intersection)
-                        })
+                # Determine severity
+                max_distribution = max(u['distribution_pct'] for u in urls_above_threshold)
+                severity = self._calculate_severity(num_urls_affected, max_distribution, 
+                                                 len(urls_above_threshold))
+                
+                cannibalized_queries.append({
+                    'query': query,
+                    'total_clicks': int(total_clicks),
+                    'num_urls_affected': num_urls_affected,
+                    'urls_above_threshold': len(urls_above_threshold),
+                    'click_distributions': url_distributions,
+                    'severity': severity,
+                    'max_distribution_pct': max_distribution
+                })
+                
+                # Add URLs to affected set
+                urls_affected.update(urls_in_query)
+            
+            # Add to general analysis
+            query_analysis.append({
+                'query': query,
+                'total_clicks': int(total_clicks),
+                'num_urls': len(urls_in_query),
+                'click_distributions': url_distributions,
+                'is_cannibalized': len(urls_above_threshold) >= 2
+            })
         
         return {
-            'serp_data': serp_data,
-            'overlaps': serp_overlaps
+            'query_analysis': query_analysis,
+            'cannibalized_queries': cannibalized_queries,
+            'total_queries_analyzed': len(query_analysis),
+            'total_cannibalized_queries': len(cannibalized_queries),
+            'total_urls_affected': len(urls_affected),
+            'severity_breakdown': self._calculate_severity_breakdown(cannibalized_queries)
         }
     
-    def _generate_reports(self, results: Dict[str, Any], config: AnalysisConfig) -> Dict[str, pd.DataFrame]:
-        """Generate comprehensive analysis reports."""
-        df = st.session_state.gsc_data
+    def _calculate_severity(self, num_urls: int, max_distribution: float, urls_above_threshold: int) -> str:
+        """Calculate cannibalization severity based on refined criteria."""
+        
+        # HIGH severity scenarios
+        if (num_urls >= 5 and max_distribution >= 10) or \
+           (3 <= num_urls <= 4 and 20 <= max_distribution <= 25) or \
+           (num_urls >= 2 and max_distribution >= 30):
+            return "HIGH"
+        
+        # MEDIUM severity scenarios  
+        elif (3 <= num_urls <= 4 and 15 <= max_distribution < 20) or \
+             (num_urls >= 2 and 25 <= max_distribution < 30) or \
+             (num_urls >= 5 and max_distribution < 10):
+            return "MEDIUM"
+        
+        # LOW severity (everything else that qualifies as cannibalization)
+        else:
+            return "LOW"
+    
+    def _calculate_severity_breakdown(self, cannibalized_queries: List[Dict]) -> Dict[str, int]:
+        """Calculate breakdown of cannibalization by severity."""
+        breakdown = {"HIGH": 0, "MEDIUM": 0, "LOW": 0}
+        for query_data in cannibalized_queries:
+            severity = query_data.get('severity', 'LOW')
+            breakdown[severity] += 1
+        return breakdown
+    
+    def _generate_reports(self, results: Dict[str, Any], df: pd.DataFrame) -> Dict[str, pd.DataFrame]:
+        """Generate comprehensive reports."""
         reports = {}
         
         # URL-Based Report
-        if 'query_overlap' in results:
-            url_report = self._create_url_based_report(df, results, config)
-            reports['url_based'] = url_report
+        reports['url_based'] = self._create_url_based_report(results, df)
         
-        # Query-Based Report
-        if 'serp_overlap' in results:
-            query_report = self._create_query_based_report(df, results, config)
-            reports['query_based'] = query_report
+        # Query-Based Report  
+        reports['query_based'] = self._create_query_based_report(results, df)
         
         # Cannibalization Report
-        if 'query_overlap' in results:
-            cannibalization_report = self._create_cannibalization_report(results, df)
-            reports['cannibalization'] = cannibalization_report
+        reports['cannibalization'] = self._create_cannibalization_report(results)
         
         return reports
     
-    def _create_url_based_report(self, df: pd.DataFrame, results: Dict[str, Any], config: AnalysisConfig) -> pd.DataFrame:
-        """Create comprehensive URL-based analysis report with CORRECTED cannibalization flags."""
+    def _create_url_based_report(self, results: Dict[str, Any], df: pd.DataFrame) -> pd.DataFrame:
+        """Create URL-based analysis report."""
+        # Basic URL statistics
+        url_stats = df.groupby('url').agg({
+            'query': 'nunique',
+            'clicks': 'sum',
+            'impressions': 'sum' if 'impressions' in df.columns else lambda x: 0
+        }).round(0)
         
-        # Build aggregation dictionary based on available columns
-        agg_dict = {'query': 'nunique'}  # Always available
+        url_stats.columns = ['unique_queries', 'total_clicks', 'total_impressions']
+        url_stats = url_stats.astype(int)
         
-        if 'clicks' in df.columns:
-            agg_dict['clicks'] = 'sum'
-        if 'impressions' in df.columns:
-            agg_dict['impressions'] = 'sum'
+        # Add cannibalization flags
+        cannibalized_urls = set()
+        severity_flags = {}
+        cannibalized_queries_count = {}
         
-        url_stats = df.groupby('url').agg(agg_dict).round(2)
+        for query_data in results['cannibalized_queries']:
+            for url_data in query_data['click_distributions']:
+                url = url_data['url']
+                if url_data['distribution_pct'] >= st.session_state.analysis_config.click_distribution_threshold:
+                    cannibalized_urls.add(url)
+                    
+                    # Track highest severity for this URL
+                    current_severity = severity_flags.get(url, "LOW")
+                    new_severity = query_data['severity']
+                    
+                    if new_severity == "HIGH" or (new_severity == "MEDIUM" and current_severity == "LOW"):
+                        severity_flags[url] = new_severity
+                    
+                    # Count cannibalized queries
+                    cannibalized_queries_count[url] = cannibalized_queries_count.get(url, 0) + 1
         
-        # Rename columns for clarity
-        column_rename = {'query': 'unique_queries'}
-        if 'clicks' in url_stats.columns:
-            column_rename['clicks'] = 'total_clicks'
-        if 'impressions' in url_stats.columns:
-            column_rename['impressions'] = 'total_impressions'
+        url_stats['cannibalization_flag'] = url_stats.index.map(lambda x: x in cannibalized_urls)
+        url_stats['cannibalization_severity'] = url_stats.index.map(lambda x: severity_flags.get(x, "NONE"))
+        url_stats['cannibalized_queries_count'] = url_stats.index.map(lambda x: cannibalized_queries_count.get(x, 0))
         
-        url_stats = url_stats.rename(columns=column_rename)
-        
-        # Add query overlap information with CORRECTED cannibalization flags
-        query_overlaps = results.get('query_overlap', {}).get('overlaps', [])
-        
-        # Calculate high SERP overlaps count
-        serp_overlaps = results.get('serp_overlap', {}).get('overlaps', [])
-        high_serp_overlaps = {}
-        
-        for overlap in serp_overlaps:
-            if overlap['serp_overlap_pct'] >= config.serp_overlap_threshold:
-                for _, row in df.iterrows():
-                    if row['query'] in [overlap['query1'], overlap['query2']]:
-                        url = row['url']
-                        if url not in high_serp_overlaps:
-                            high_serp_overlaps[url] = 0
-                        high_serp_overlaps[url] += 1
-        
-        url_stats['high_serp_overlaps'] = url_stats.index.map(lambda x: high_serp_overlaps.get(x, 0))
-        
-        # CORRECTED: True cannibalization flags based on click volume similarity
-        true_cannibalization_flags = {}
-        cannibalization_counts = {}
-        
-        for overlap in query_overlaps:
-            url1, url2 = overlap['url1'], overlap['url2']
-            cannibalization_count = overlap['true_cannibalization_count']
-            
-            if cannibalization_count > 0:
-                true_cannibalization_flags[url1] = True
-                true_cannibalization_flags[url2] = True
-                
-                cannibalization_counts[url1] = cannibalization_counts.get(url1, 0) + cannibalization_count
-                cannibalization_counts[url2] = cannibalization_counts.get(url2, 0) + cannibalization_count
-        
-        url_stats['true_cannibalization_flag'] = url_stats.index.map(lambda x: true_cannibalization_flags.get(x, False))
-        url_stats['cannibalized_queries_count'] = url_stats.index.map(lambda x: cannibalization_counts.get(x, 0))
-        
-        # Add top queries - Fix pandas warning
-        if 'clicks' in df.columns:
-            top_queries = (
-                df.groupby('url', group_keys=False)[['query', 'clicks']]
-                .apply(lambda g: ', '.join(g.nlargest(3, 'clicks')['query'].values), include_groups=False)
-            )
-        else:
-            # Fallback if no clicks column
-            top_queries = (
-                df.groupby('url', group_keys=False)['query']
-                .apply(lambda g: ', '.join(g.head(3).values), include_groups=False)
-            )
-        
+        # Add top queries
+        top_queries = (
+            df.groupby('url', group_keys=False)[['query', 'clicks']]
+            .apply(lambda g: ', '.join(g.nlargest(3, 'clicks')['query'].values), include_groups=False)
+        )
         url_stats['top_queries'] = top_queries
         
         return url_stats.reset_index()
     
-    def _create_cannibalization_report(self, results: Dict[str, Any], df: pd.DataFrame) -> pd.DataFrame:
-        """Create detailed cannibalization report showing specific query conflicts."""
-        cannibalized_queries = results.get('query_overlap', {}).get('cannibalized_queries', [])
-        
-        if not cannibalized_queries:
-            return pd.DataFrame(columns=['query', 'url1', 'url1_clicks', 'url2', 'url2_clicks', 'similarity_ratio', 'total_clicks'])
-        
-        report_data = []
-        for item in cannibalized_queries:
-            total_clicks = item['url1_clicks'] + item['url2_clicks']
-            
-            # Get URL names from the data
-            url1_data = df[df['query'] == item['query']].iloc[0]  # Get first match for URL info
-            
-            report_data.append({
-                'query': item['query'],
-                'url1': 'URL 1',  # Will be replaced with actual URLs
-                'url1_clicks': item['url1_clicks'],
-                'url2': 'URL 2',  # Will be replaced with actual URLs  
-                'url2_clicks': item['url2_clicks'],
-                'similarity_ratio': round(item['similarity_ratio'], 2),
-                'total_clicks': total_clicks,
-                'click_distribution': f"{item['url1_clicks']}/{item['url2_clicks']}"
-            })
-        
-        cannibalization_df = pd.DataFrame(report_data)
-        return cannibalization_df.sort_values('total_clicks', ascending=False)
-    
-    def _create_query_based_report(self, df: pd.DataFrame, results: Dict[str, Any], config: AnalysisConfig) -> pd.DataFrame:
-        """Create detailed query-based analysis report with defensive column handling."""
-        serp_overlaps = results.get('serp_overlap', {}).get('overlaps', [])
-        
+    def _create_query_based_report(self, results: Dict[str, Any], df: pd.DataFrame) -> pd.DataFrame:
+        """Create query-based cannibalization report."""
         query_report_data = []
         
-        for overlap in serp_overlaps:
-            if overlap['serp_overlap_pct'] >= (config.serp_overlap_threshold / 2):
-                query1 = overlap['query1']
-                query2 = overlap['query2']
-                overlap_pct = overlap['serp_overlap_pct']
+        for query_data in results['cannibalized_queries']:
+            query = query_data['query']
+            
+            for url_data in query_data['click_distributions']:
+                # Get additional metrics from original data
+                original_data = df[(df['query'] == query) & (df['url'] == url_data['url'])]
                 
-                # Get URL information for each query
-                q1_urls = df[df['query'] == query1]['url'].values
-                q2_urls = df[df['query'] == query2]['url'].values
-                
-                for url in q1_urls:
+                if not original_data.empty:
+                    row = original_data.iloc[0]
+                    
                     query_report_data.append({
-                        'url': url,
-                        'query': query1,
-                        'serp_overlap_pct': overlap_pct,
-                        'competing_query': query2,
-                        'competing_urls': ', '.join(q2_urls)
+                        'query': query,
+                        'url': url_data['url'],
+                        'clicks': url_data['clicks'],
+                        'click_distribution_pct': url_data['distribution_pct'],
+                        'impressions': int(row.get('impressions', 0)) if 'impressions' in row else 0,
+                        'ctr': round(row.get('ctr', 0), 2) if 'ctr' in row else 0,
+                        'position': round(row.get('position', 0), 1) if 'position' in row else 0,
+                        'total_query_clicks': query_data['total_clicks'],
+                        'num_competing_urls': query_data['num_urls_affected'],
+                        'severity': query_data['severity']
                     })
         
         if query_report_data:
-            query_report = pd.DataFrame(query_report_data)
-            
-            # Add performance metrics - ONLY include columns that actually exist
-            available_perf_cols = ['url', 'query']  # Always required
-            optional_cols = ['clicks', 'impressions', 'ctr', 'position']
-            
-            for col in optional_cols:
-                if col in df.columns:
-                    available_perf_cols.append(col)
-            
-            performance_data = df[available_perf_cols].copy()
-            
-            query_report = query_report.merge(
-                performance_data,
-                on=['url', 'query'],
-                how='left'
-            )
-            
-            return query_report.sort_values('serp_overlap_pct', ascending=False)
+            query_df = pd.DataFrame(query_report_data)
+            return query_df.sort_values(['severity', 'total_query_clicks'], 
+                                      ascending=[False, False])
         else:
-            return pd.DataFrame(columns=['url', 'query', 'serp_overlap_pct'])
+            return pd.DataFrame(columns=['query', 'url', 'clicks', 'click_distribution_pct'])
+    
+    def _create_cannibalization_report(self, results: Dict[str, Any]) -> pd.DataFrame:
+        """Create detailed cannibalization report with actual URL names."""
+        cannibalization_data = []
+        
+        for query_data in results['cannibalized_queries']:
+            query = query_data['query']
+            distributions = query_data['click_distributions']
+            
+            # Only include URLs above threshold
+            significant_urls = [u for u in distributions 
+                              if u['distribution_pct'] >= st.session_state.analysis_config.click_distribution_threshold]
+            
+            # Create entry for this cannibalized query
+            url_list = []
+            click_list = []
+            distribution_list = []
+            
+            for i, url_data in enumerate(significant_urls):
+                url_list.append(f"URL_{i+1}: {url_data['url'][:50]}...")  # Truncate for display
+                click_list.append(url_data['clicks'])
+                distribution_list.append(f"{url_data['distribution_pct']}%")
+            
+            cannibalization_data.append({
+                'query': query,
+                'severity': query_data['severity'],
+                'total_clicks': query_data['total_clicks'],
+                'num_urls_competing': len(significant_urls),
+                'competing_urls': ' | '.join(url_list),
+                'click_distribution': ' | '.join([f"{c} ({d})" for c, d in zip(click_list, distribution_list)]),
+                'max_distribution_pct': query_data['max_distribution_pct']
+            })
+        
+        if cannibalization_data:
+            cannibalization_df = pd.DataFrame(cannibalization_data)
+            return cannibalization_df.sort_values(['severity', 'total_clicks'], 
+                                                ascending=[False, False])
+        else:
+            return pd.DataFrame(columns=['query', 'severity', 'total_clicks', 'num_urls_competing'])
     
     def _render_analysis_results(self):
-        """Render comprehensive analysis results with enhanced visualizations."""
+        """Render analysis results with updated tabs."""
         results = st.session_state.analysis_results
         
-        # Create tabs for different result views
+        # Create tabs (removed SERP overlap as requested)
         tabs = st.tabs(["📊 Overview", "🌐 URL-Based Report", "🔍 Query-Based Report", "⚠️ Cannibalization Report", "📈 Visualizations"])
         
         with tabs[0]:
@@ -971,61 +741,55 @@ class StreamlitGSCAnalyzer:
             self._render_visualizations(results)
     
     def _render_overview(self, results: Dict[str, Any]):
-        """Render comprehensive analysis overview with CORRECTED cannibalization metrics."""
+        """Render analysis overview with corrected metrics."""
         st.markdown("## 📊 Analysis Overview")
         
-        # Key metrics
+        # Key metrics with corrected logic
         col1, col2, col3, col4 = st.columns(4)
         
-        query_overlaps = results.get('query_overlap', {}).get('overlaps', [])
-        serp_overlaps = results.get('serp_overlap', {}).get('overlaps', [])
-        cannibalized_queries = results.get('query_overlap', {}).get('cannibalized_queries', [])
-        
         with col1:
-            st.metric("URL Pairs with Query Overlaps", len(query_overlaps))
+            st.metric("Total Queries Analyzed", f"{results['total_queries_analyzed']:,}")
         
         with col2:
-            true_cannibalization_pairs = len([o for o in query_overlaps if o['true_cannibalization_count'] > 0])
-            st.metric("TRUE Cannibalization Cases", true_cannibalization_pairs)
+            st.metric("TRUE Cannibalization Cases", f"{results['total_cannibalized_queries']:,}")
         
         with col3:
-            st.metric("Cannibalized Queries", len(cannibalized_queries))
+            st.metric("URLs Affected", f"{results['total_urls_affected']:,}")
         
         with col4:
-            config = st.session_state.analysis_config
-            high_serp_overlaps = len([o for o in serp_overlaps if o['serp_overlap_pct'] >= config.serp_overlap_threshold])
-            st.metric(f"High SERP Overlaps (≥{config.serp_overlap_threshold}%)", high_serp_overlaps)
+            severity_breakdown = results['severity_breakdown']
+            high_severity = severity_breakdown.get('HIGH', 0)
+            st.metric("High Severity Cases", f"{high_severity:,}")
         
-        # Insights
+        # Severity breakdown
+        st.markdown("### 🎯 Severity Breakdown")
+        severity_breakdown = results['severity_breakdown']
+        
+        col1, col2, col3 = st.columns(3)
+        
+        with col1:
+            st.markdown('<div class="high-severity">', unsafe_allow_html=True)
+            st.metric("🔴 HIGH Severity", f"{severity_breakdown.get('HIGH', 0):,}")
+            st.markdown("</div>", unsafe_allow_html=True)
+        
+        with col2:
+            st.markdown('<div class="medium-severity">', unsafe_allow_html=True)
+            st.metric("🟡 MEDIUM Severity", f"{severity_breakdown.get('MEDIUM', 0):,}")
+            st.markdown("</div>", unsafe_allow_html=True)
+        
+        with col3:
+            st.markdown('<div class="low-severity">', unsafe_allow_html=True)
+            st.metric("🟣 LOW Severity", f"{severity_breakdown.get('LOW', 0):,}")
+            st.markdown("</div>", unsafe_allow_html=True)
+        
+        # Key insights
         st.markdown("### 🎯 Key Insights")
         insights = self._generate_insights(results)
         for insight in insights:
             st.markdown(f"• {insight}")
     
-    def _render_cannibalization_report(self, results: Dict[str, Any]):
-        """Render detailed cannibalization report."""
-        st.markdown("## ⚠️ Cannibalization Report")
-        st.markdown("**This report shows queries where multiple URLs receive similar click volumes, indicating true traffic splitting.**")
-        
-        reports = results.get('reports', {})
-        cannibalization_report = reports.get('cannibalization')
-        
-        if cannibalization_report is not None and not cannibalization_report.empty:
-            st.dataframe(cannibalization_report, use_container_width=True, height=400)
-            
-            # Download button
-            csv = cannibalization_report.to_csv(index=False)
-            st.download_button(
-                label="📥 Download Cannibalization Report",
-                data=csv,
-                file_name=f"cannibalization_report_{datetime.now().strftime('%Y%m%d_%H%M%S')}.csv",
-                mime="text/csv"
-            )
-        else:
-            st.success("🎉 No true cannibalization detected! Your URLs have proper keyword ownership.")
-    
     def _render_url_report(self, results: Dict[str, Any]):
-        """Render URL-based report with download functionality."""
+        """Render URL-based report."""
         st.markdown("## 🌐 URL-Based Report")
         
         reports = results.get('reports', {})
@@ -1034,7 +798,6 @@ class StreamlitGSCAnalyzer:
         if url_report is not None and not url_report.empty:
             st.dataframe(url_report, use_container_width=True, height=400)
             
-            # Download button
             csv = url_report.to_csv(index=False)
             st.download_button(
                 label="📥 Download URL Report",
@@ -1046,8 +809,9 @@ class StreamlitGSCAnalyzer:
             st.info("No URL-based report data available")
     
     def _render_query_report(self, results: Dict[str, Any]):
-        """Render Query-based report with interactive filtering."""
+        """Render Query-based report (now properly implemented)."""
         st.markdown("## 🔍 Query-Based Report")
+        st.markdown("**Shows each cannibalized query with detailed metrics for every competing URL.**")
         
         reports = results.get('reports', {})
         query_report = reports.get('query_based')
@@ -1057,12 +821,10 @@ class StreamlitGSCAnalyzer:
             col1, col2 = st.columns(2)
             
             with col1:
-                min_overlap = st.slider(
-                    "Minimum SERP Overlap %",
-                    min_value=0.0,
-                    max_value=100.0,
-                    value=25.0,
-                    step=5.0
+                severity_filter = st.selectbox(
+                    "Filter by Severity",
+                    ["All", "HIGH", "MEDIUM", "LOW"],
+                    index=0
                 )
             
             with col2:
@@ -1075,13 +837,14 @@ class StreamlitGSCAnalyzer:
                 )
             
             # Apply filters
-            filtered_report = query_report[
-                query_report['serp_overlap_pct'] >= min_overlap
-            ].head(max_rows)
+            filtered_report = query_report
+            if severity_filter != "All":
+                filtered_report = filtered_report[filtered_report['severity'] == severity_filter]
+            
+            filtered_report = filtered_report.head(max_rows)
             
             st.dataframe(filtered_report, use_container_width=True, height=400)
             
-            # Download button
             csv = filtered_report.to_csv(index=False)
             st.download_button(
                 label="📥 Download Query Report",
@@ -1090,95 +853,106 @@ class StreamlitGSCAnalyzer:
                 mime="text/csv"
             )
         else:
-            st.info("No Query-based report data available")
+            st.success("🎉 No query-level cannibalization detected!")
+    
+    def _render_cannibalization_report(self, results: Dict[str, Any]):
+        """Render detailed cannibalization report with actual URLs."""
+        st.markdown("## ⚠️ Cannibalization Report")
+        st.markdown("**Detailed view of each cannibalized query with competing URLs and click distributions.**")
+        
+        reports = results.get('reports', {})
+        cannibalization_report = reports.get('cannibalization')
+        
+        if cannibalization_report is not None and not cannibalization_report.empty:
+            st.dataframe(cannibalization_report, use_container_width=True, height=400)
+            
+            csv = cannibalization_report.to_csv(index=False)
+            st.download_button(
+                label="📥 Download Cannibalization Report",
+                data=csv,
+                file_name=f"cannibalization_report_{datetime.now().strftime('%Y%m%d_%H%M%S')}.csv",
+                mime="text/csv"
+            )
+        else:
+            st.success("🎉 No cannibalization detected! Your URLs have proper keyword ownership.")
     
     def _render_visualizations(self, results: Dict[str, Any]):
-        """Render enhanced data visualizations with CORRECTED cannibalization metrics."""
+        """Render data visualizations."""
         st.markdown("## 📈 Visualizations")
         
-        # True cannibalization distribution
-        cannibalized_queries = results.get('query_overlap', {}).get('cannibalized_queries', [])
+        cannibalized_queries = results.get('cannibalized_queries', [])
+        
         if cannibalized_queries:
-            similarity_ratios = [item['similarity_ratio'] for item in cannibalized_queries]
+            # Severity distribution
+            severity_counts = results.get('severity_breakdown', {})
             
-            fig_cannib = px.histogram(
-                x=similarity_ratios,
-                nbins=15,
-                title="Distribution of Click Similarity Ratios (Cannibalized Queries)",
-                labels={'x': 'Click Similarity Ratio', 'y': 'Count of Queries'}
+            fig_severity = px.pie(
+                values=list(severity_counts.values()),
+                names=list(severity_counts.keys()),
+                title="Cannibalization by Severity Level",
+                color_discrete_map={'HIGH': '#f44336', 'MEDIUM': '#ff9800', 'LOW': '#9c27b0'}
             )
-            st.plotly_chart(fig_cannib, use_container_width=True)
-        
-        # SERP Overlap Distribution
-        serp_overlaps = results.get('serp_overlap', {}).get('overlaps', [])
-        if serp_overlaps:
-            serp_percentages = [overlap['serp_overlap_pct'] for overlap in serp_overlaps]
+            st.plotly_chart(fig_severity, use_container_width=True)
             
-            fig_serp = px.histogram(
-                x=serp_percentages,
+            # Click distribution histogram
+            max_distributions = [q['max_distribution_pct'] for q in cannibalized_queries]
+            
+            fig_dist = px.histogram(
+                x=max_distributions,
                 nbins=20,
-                title="Distribution of SERP Overlap Percentages",
-                labels={'x': 'SERP Overlap Percentage', 'y': 'Count'}
+                title="Distribution of Maximum Click Percentages in Cannibalized Queries",
+                labels={'x': 'Maximum Click Distribution %', 'y': 'Number of Queries'}
             )
-            st.plotly_chart(fig_serp, use_container_width=True)
-        
-        # Top URL Performance
-        df = st.session_state.gsc_data
-        if 'clicks' in df.columns:
-            top_urls = df.groupby('url').agg({
-                'clicks': 'sum',
-                'impressions': 'sum' if 'impressions' in df.columns else lambda x: 0
-            }).sort_values('clicks', ascending=False).head(10)
+            st.plotly_chart(fig_dist, use_container_width=True)
             
-            fig_urls = px.bar(
-                x=top_urls.index,
-                y=top_urls['clicks'],
-                title="Top 10 URLs by Clicks",
-                labels={'x': 'URL', 'y': 'Total Clicks'}
+            # Number of competing URLs
+            num_urls = [q['num_urls_affected'] for q in cannibalized_queries]
+            
+            fig_urls = px.histogram(
+                x=num_urls,
+                nbins=10,
+                title="Number of Competing URLs per Cannibalized Query",
+                labels={'x': 'Number of Competing URLs', 'y': 'Number of Queries'}
             )
-            fig_urls.update_xaxes(tickangle=45)
             st.plotly_chart(fig_urls, use_container_width=True)
+        else:
+            st.info("No cannibalization data available for visualization.")
     
     def _generate_insights(self, results: Dict[str, Any]) -> List[str]:
-        """Generate actionable insights from analysis results with CORRECTED cannibalization logic."""
+        """Generate actionable insights."""
         insights = []
         
-        query_overlaps = results.get('query_overlap', {}).get('overlaps', [])
-        serp_overlaps = results.get('serp_overlap', {}).get('overlaps', [])
-        cannibalized_queries = results.get('query_overlap', {}).get('cannibalized_queries', [])
-        config = st.session_state.analysis_config
+        total_cannibalized = results['total_cannibalized_queries']
+        total_urls_affected = results['total_urls_affected']
+        severity_breakdown = results['severity_breakdown']
         
-        # True cannibalization insights
-        if cannibalized_queries:
-            insights.append(f"🚨 Found {len(cannibalized_queries)} queries with true cannibalization - multiple URLs receiving similar click volumes")
+        if total_cannibalized > 0:
+            insights.append(f"🚨 Found {total_cannibalized} queries with TRUE cannibalization affecting {total_urls_affected} URLs")
             
-            # Find the most severe cases
-            high_traffic_cannibalization = [q for q in cannibalized_queries if q['url1_clicks'] + q['url2_clicks'] >= 50]
-            if high_traffic_cannibalization:
-                insights.append(f"⚠️ {len(high_traffic_cannibalization)} high-traffic queries are being cannibalized (50+ total clicks)")
-                
-            # Show similarity ratios
-            avg_similarity = sum(q['similarity_ratio'] for q in cannibalized_queries) / len(cannibalized_queries)
-            insights.append(f"📊 Average click similarity ratio: {avg_similarity:.2f} (higher = more severe cannibalization)")
+            high_severity = severity_breakdown.get('HIGH', 0)
+            if high_severity > 0:
+                insights.append(f"⚠️ {high_severity} queries have HIGH severity cannibalization - immediate attention required")
+            
+            medium_severity = severity_breakdown.get('MEDIUM', 0)
+            if medium_severity > 0:
+                insights.append(f"📊 {medium_severity} queries have MEDIUM severity - consider consolidation strategies")
+            
+            # Calculate average URLs affected
+            if results.get('cannibalized_queries'):
+                avg_urls = sum(q['num_urls_affected'] for q in results['cannibalized_queries']) / len(results['cannibalized_queries'])
+                insights.append(f"📈 Average {avg_urls:.1f} URLs competing per cannibalized query")
         else:
-            insights.append("✅ No true cannibalization detected - your URLs have proper keyword ownership")
-        
-        # SERP overlap insights
-        if serp_overlaps:
-            high_serp_overlaps = [o for o in serp_overlaps if o['serp_overlap_pct'] >= config.serp_overlap_threshold]
-            if high_serp_overlaps:
-                insights.append(f"🔍 Identified {len(high_serp_overlaps)} query pairs with high SERP overlap - competing for similar search results")
+            insights.append("✅ No true cannibalization detected - excellent keyword ownership structure!")
         
         return insights
     
     def _reset_analysis(self):
-        """Reset analysis results and start over."""
+        """Reset analysis results."""
         st.session_state.analysis_results = None
-        st.session_state.analysis_progress = 0
-        st.success("🔄 Analysis reset. You can now run a new analysis.")
+        st.success("🔄 Analysis reset. You can run a new analysis.")
     
     def run(self):
-        """Run the main application with comprehensive error handling."""
+        """Run the main application."""
         try:
             self.render_header()
             self.render_sidebar()
@@ -1188,7 +962,7 @@ class StreamlitGSCAnalyzer:
             logger.error(f"Application error: {e}")
 
 def main():
-    """Main application entry point with error handling."""
+    """Main application entry point."""
     try:
         app = StreamlitGSCAnalyzer()
         app.run()
