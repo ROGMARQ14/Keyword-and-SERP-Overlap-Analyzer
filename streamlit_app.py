@@ -78,7 +78,6 @@ class AnalysisConfig:
     serp_overlap_threshold: float = 50.0
     api_delay: float = 1.0
     batch_size: int = 10
-    # Removed max_queries - no artificial limits per user request
 
 class EnhancedCSVProcessor:
     """Enhanced CSV processor with automatic delimiter detection and flexible column mapping."""
@@ -357,25 +356,20 @@ class StreamlitGSCAnalyzer:
         """)
     
     def render_sidebar(self):
-        """Render the sidebar with configuration options."""
+        """Render the sidebar with updated layout - API first, then data upload."""
         st.sidebar.title("⚙️ Configuration")
         
-        # File Upload Section
-        st.sidebar.subheader("📁 Data Upload")
-        self._render_file_upload()
-        
-        # API Configuration
+        # API Configuration (moved to top as requested)
         st.sidebar.subheader("🔑 API Configuration")
         self._render_api_config()
+        
+        # File Upload Section (below API config as requested)
+        st.sidebar.subheader("📁 Data Upload")
+        self._render_file_upload()
         
         # Analysis Parameters
         st.sidebar.subheader("📊 Analysis Parameters")
         self._render_analysis_parameters()
-        
-        # Help Section
-        st.sidebar.subheader("❓ Help")
-        with st.sidebar.expander("Supported Column Names"):
-            self._show_column_mapping_help()
     
     def _render_file_upload(self):
         """Render the enhanced file upload section."""
@@ -416,7 +410,7 @@ class StreamlitGSCAnalyzer:
                 st.session_state.serp_api_client = SerpAPIClient(api_key=serp_api_key)
     
     def _render_analysis_parameters(self):
-        """Render analysis parameters section - NO query limits per user request."""
+        """Render analysis parameters section - removed cost estimation and help."""
         config = st.session_state.analysis_config
         
         config.min_clicks = st.sidebar.number_input(
@@ -445,7 +439,7 @@ class StreamlitGSCAnalyzer:
             help="Delay between API calls to avoid rate limiting"
         )
         
-        # Show actual query count instead of artificial limits
+        # Show actual query count instead of cost estimation (removed as requested)
         if st.session_state.gsc_data is not None:
             df = st.session_state.gsc_data
             eligible_queries = len(df[df['clicks'] >= config.min_clicks])
@@ -485,22 +479,6 @@ class StreamlitGSCAnalyzer:
         except Exception as e:
             st.sidebar.error(f"❌ API validation error: {str(e)}")
     
-    def _show_column_mapping_help(self):
-        """Show enhanced column mapping help information."""
-        mapping_info = {
-            "Query/Keywords": "query, queries, keyword, keywords, search term",
-            "URL/Page": "url, page, landing page, address, destination url",
-            "Clicks": "click, clicks, total clicks",
-            "Impressions": "impression, impressions, total impressions",
-            "CTR": "ctr, url ctr, click through rate",
-            "Position": "position, avg pos, average position, rank"
-        }
-        
-        for col_type, variations in mapping_info.items():
-            st.write(f"**{col_type}:**")
-            st.write(variations)
-            st.write("")
-    
     def render_main_content(self):
         """Render the main content area."""
         if st.session_state.gsc_data is None:
@@ -517,16 +495,17 @@ class StreamlitGSCAnalyzer:
         with col1:
             st.markdown("### 🚀 Getting Started")
             st.markdown("""
-            1. **Upload your GSC data** in the sidebar
-            2. **Enter your Serper API key**
-            3. **Configure analysis parameters**
-            4. **Run the analysis**
+            1. **Enter your Serper API key** in the sidebar
+            2. **Upload your GSC data** in the sidebar
+            3. **Click Process File**
+            4. **Configure analysis parameters**
+            5. **Run the analysis**
             """)
         
         with col2:
             st.markdown("### 📊 What You'll Get")
             st.markdown("""
-            - **Query Overlap Analysis** between URLs
+            - **Query Overlap Analysis** with click-weighted metrics
             - **SERP Overlap Analysis** using live data
             - **URL-based Reports** for high-level insights
             - **Query-based Reports** for detailed analysis
@@ -623,30 +602,53 @@ class StreamlitGSCAnalyzer:
             logger.error(f"Analysis error: {e}")
     
     def _analyze_query_overlaps(self, df: pd.DataFrame) -> Dict[str, Any]:
-        """Analyze query overlaps between URLs."""
-        # Group queries by URL
-        url_queries = df.groupby('url')['query'].apply(set).to_dict()
+        """Analyze query overlaps between URLs with weighted click consideration."""
+        # Group queries by URL with click data
+        url_queries = {}
+        for _, row in df.iterrows():
+            url = row['url']
+            query = row['query']
+            clicks = row['clicks']
+            
+            if url not in url_queries:
+                url_queries[url] = {}
+            url_queries[url][query] = clicks
         
-        # Calculate overlaps
+        # Calculate overlaps with weighted metrics
         overlaps = []
         url_pairs = list(combinations(url_queries.keys(), 2))
         
         for url1, url2 in url_pairs:
-            queries1 = url_queries[url1]
-            queries2 = url_queries[url2]
+            queries1 = set(url_queries[url1].keys())
+            queries2 = set(url_queries[url2].keys())
             
             intersection = queries1.intersection(queries2)
             
             if len(intersection) > 0:
+                # Traditional overlap percentages
                 overlap_1_to_2 = len(intersection) / len(queries1) * 100
                 overlap_2_to_1 = len(intersection) / len(queries2) * 100
+                
+                # NEW: Weighted click share calculation
+                shared_clicks_url1 = sum(url_queries[url1][query] for query in intersection)
+                shared_clicks_url2 = sum(url_queries[url2][query] for query in intersection)
+                
+                total_clicks_url1 = sum(url_queries[url1].values())
+                total_clicks_url2 = sum(url_queries[url2].values())
+                
+                click_share_url1 = (shared_clicks_url1 / total_clicks_url1) * 100 if total_clicks_url1 > 0 else 0
+                click_share_url2 = (shared_clicks_url2 / total_clicks_url2) * 100 if total_clicks_url2 > 0 else 0
                 
                 overlaps.append({
                     'url1': url1,
                     'url2': url2,
                     'shared_queries': len(intersection),
-                    'url1_overlap_pct': overlap_1_to_2,
-                    'url2_overlap_pct': overlap_2_to_1,
+                    'url1_overlap_pct': round(overlap_1_to_2, 2),
+                    'url2_overlap_pct': round(overlap_2_to_1, 2),
+                    'url1_click_share_pct': round(click_share_url1, 2),
+                    'url2_click_share_pct': round(click_share_url2, 2),
+                    'shared_clicks_url1': shared_clicks_url1,
+                    'shared_clicks_url2': shared_clicks_url2,
                     'shared_query_list': list(intersection)
                 })
         
@@ -738,7 +740,7 @@ class StreamlitGSCAnalyzer:
         return reports
     
     def _create_url_based_report(self, df: pd.DataFrame, results: Dict[str, Any], config: AnalysisConfig) -> pd.DataFrame:
-        """Create comprehensive URL-based analysis report with optional column support."""
+        """Create comprehensive URL-based analysis report with click-weighted metrics."""
         
         # Build aggregation dictionary based on available columns
         agg_dict = {'query': 'nunique'}  # Always available
@@ -759,7 +761,7 @@ class StreamlitGSCAnalyzer:
         
         url_stats = url_stats.rename(columns=column_rename)
         
-        # Add query overlap information
+        # Add query overlap information with click-weighted flags
         query_overlaps = results.get('query_overlap', {}).get('overlaps', [])
         
         # Calculate high SERP overlaps count
@@ -776,6 +778,19 @@ class StreamlitGSCAnalyzer:
                         high_serp_overlaps[url] += 1
         
         url_stats['high_serp_overlaps'] = url_stats.index.map(lambda x: high_serp_overlaps.get(x, 0))
+        
+        # Add click-weighted overlap flags
+        high_click_overlap_flags = {}
+        for overlap in query_overlaps:
+            url1, url2 = overlap['url1'], overlap['url2']
+            
+            # Flag URLs with high click share overlap (≥50%)
+            if overlap['url1_click_share_pct'] >= 50:
+                high_click_overlap_flags[url1] = True
+            if overlap['url2_click_share_pct'] >= 50:
+                high_click_overlap_flags[url2] = True
+        
+        url_stats['high_click_overlap_flag'] = url_stats.index.map(lambda x: high_click_overlap_flags.get(x, False))
         
         # Add top queries - Fix pandas warning
         if 'clicks' in df.columns:
@@ -862,7 +877,7 @@ class StreamlitGSCAnalyzer:
             self._render_visualizations(results)
     
     def _render_overview(self, results: Dict[str, Any]):
-        """Render comprehensive analysis overview."""
+        """Render comprehensive analysis overview with click-weighted metrics."""
         st.markdown("## 📊 Analysis Overview")
         
         # Key metrics
@@ -875,8 +890,8 @@ class StreamlitGSCAnalyzer:
             st.metric("URL Pairs with Query Overlaps", len(query_overlaps))
         
         with col2:
-            high_query_overlaps = len([o for o in query_overlaps if o['url1_overlap_pct'] > 50 or o['url2_overlap_pct'] > 50])
-            st.metric("High Query Overlaps (>50%)", high_query_overlaps)
+            high_click_overlaps = len([o for o in query_overlaps if o['url1_click_share_pct'] >= 50 or o['url2_click_share_pct'] >= 50])
+            st.metric("High Click-Weighted Overlaps (≥50%)", high_click_overlaps)
         
         with col3:
             st.metric("Query Pairs with SERP Overlaps", len(serp_overlaps))
@@ -961,23 +976,23 @@ class StreamlitGSCAnalyzer:
             st.info("No Query-based report data available")
     
     def _render_visualizations(self, results: Dict[str, Any]):
-        """Render enhanced data visualizations."""
+        """Render enhanced data visualizations with click-weighted metrics."""
         st.markdown("## 📈 Visualizations")
         
-        # Query Overlap Distribution
+        # Click-weighted overlap distribution
         query_overlaps = results.get('query_overlap', {}).get('overlaps', [])
         if query_overlaps:
-            overlap_percentages = []
+            click_shares = []
             for overlap in query_overlaps:
-                overlap_percentages.extend([overlap['url1_overlap_pct'], overlap['url2_overlap_pct']])
+                click_shares.extend([overlap['url1_click_share_pct'], overlap['url2_click_share_pct']])
             
-            fig_hist = px.histogram(
-                x=overlap_percentages,
+            fig_click = px.histogram(
+                x=click_shares,
                 nbins=20,
-                title="Distribution of Query Overlap Percentages",
-                labels={'x': 'Overlap Percentage', 'y': 'Count'}
+                title="Distribution of Click-Weighted Overlap Percentages",
+                labels={'x': 'Click Share Percentage', 'y': 'Count'}
             )
-            st.plotly_chart(fig_hist, use_container_width=True)
+            st.plotly_chart(fig_click, use_container_width=True)
         
         # SERP Overlap Distribution
         serp_overlaps = results.get('serp_overlap', {}).get('overlaps', [])
@@ -1010,18 +1025,22 @@ class StreamlitGSCAnalyzer:
             st.plotly_chart(fig_urls, use_container_width=True)
     
     def _generate_insights(self, results: Dict[str, Any]) -> List[str]:
-        """Generate actionable insights from analysis results."""
+        """Generate actionable insights from analysis results with click-weighted considerations."""
         insights = []
         
         query_overlaps = results.get('query_overlap', {}).get('overlaps', [])
         serp_overlaps = results.get('serp_overlap', {}).get('overlaps', [])
         config = st.session_state.analysis_config
         
-        # Query overlap insights
+        # Click-weighted overlap insights
         if query_overlaps:
-            high_query_overlaps = [o for o in query_overlaps if o['url1_overlap_pct'] > 80 or o['url2_overlap_pct'] > 80]
-            if high_query_overlaps:
-                insights.append(f"Found {len(high_query_overlaps)} URL pairs with very high query overlap (>80%) - strong cannibalization indicators")
+            high_click_overlaps = [o for o in query_overlaps if o['url1_click_share_pct'] >= 50 or o['url2_click_share_pct'] >= 50]
+            if high_click_overlaps:
+                insights.append(f"Found {len(high_click_overlaps)} URL pairs with high click-weighted overlap (≥50% of clicks) - strong cannibalization indicators")
+                
+                # Find the most severe case
+                max_click_share = max([max(o['url1_click_share_pct'], o['url2_click_share_pct']) for o in high_click_overlaps])
+                insights.append(f"Highest click-weighted overlap: {max_click_share:.1f}% of clicks concentrated in shared queries")
         
         # SERP overlap insights
         if serp_overlaps:
