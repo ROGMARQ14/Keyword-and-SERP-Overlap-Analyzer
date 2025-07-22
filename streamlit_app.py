@@ -78,6 +78,8 @@ class AnalysisConfig:
     serp_overlap_threshold: float = 50.0
     api_delay: float = 1.0
     batch_size: int = 10
+    cannibalization_threshold: int = 10  # Minimum clicks for cannibalization detection
+    click_similarity_ratio: float = 0.5  # URLs must have at least 50% similar clicks for same keyword
 
 class EnhancedCSVProcessor:
     """Enhanced CSV processor with automatic delimiter detection and flexible column mapping."""
@@ -351,7 +353,7 @@ class StreamlitGSCAnalyzer:
         st.markdown("""
         **Identify keyword cannibalization issues through advanced overlap analysis**
         
-        This tool analyzes Google Search Console performance data and conducts SERP overlap 
+        This tool analyzes Google Search Console data and conducts SERP overlap 
         analysis to identify potential cannibalization issues between your URLs.
         """)
     
@@ -410,7 +412,7 @@ class StreamlitGSCAnalyzer:
                 st.session_state.serp_api_client = SerpAPIClient(api_key=serp_api_key)
     
     def _render_analysis_parameters(self):
-        """Render analysis parameters section - removed cost estimation and help."""
+        """Render analysis parameters section with cannibalization settings."""
         config = st.session_state.analysis_config
         
         config.min_clicks = st.sidebar.number_input(
@@ -430,6 +432,23 @@ class StreamlitGSCAnalyzer:
             help="Threshold for high SERP overlap classification"
         )
         
+        config.cannibalization_threshold = st.sidebar.number_input(
+            "Cannibalization Min Clicks",
+            min_value=5,
+            max_value=100,
+            value=config.cannibalization_threshold,
+            help="Minimum clicks required to detect cannibalization"
+        )
+        
+        config.click_similarity_ratio = st.sidebar.slider(
+            "Click Similarity Ratio",
+            min_value=0.3,
+            max_value=1.0,
+            value=config.click_similarity_ratio,
+            step=0.1,
+            help="URLs must have similar click volumes (0.5 = within 50% of each other)"
+        )
+        
         config.api_delay = st.sidebar.slider(
             "API Delay (seconds)",
             min_value=0.5,
@@ -439,7 +458,7 @@ class StreamlitGSCAnalyzer:
             help="Delay between API calls to avoid rate limiting"
         )
         
-        # Show actual query count instead of cost estimation (removed as requested)
+        # Show actual query count
         if st.session_state.gsc_data is not None:
             df = st.session_state.gsc_data
             eligible_queries = len(df[df['clicks'] >= config.min_clicks])
@@ -505,21 +524,21 @@ class StreamlitGSCAnalyzer:
         with col2:
             st.markdown("### 📊 What You'll Get")
             st.markdown("""
-            - **Query Overlap Analysis** with click-weighted metrics
+            - **True Cannibalization Detection** based on click volume similarity
             - **SERP Overlap Analysis** using live data
             - **URL-based Reports** for high-level insights
             - **Query-based Reports** for detailed analysis
             """)
         
-        st.markdown("### 📋 Required Data Format")
+        st.markdown("### 📋 Cannibalization Detection Logic")
         st.markdown("""
-        Your GSC CSV export should contain these columns (flexible naming supported):
-        - **Query/Queries**: Search terms *(required)*
-        - **URL/Page**: Landing page URLs *(required)*
-        - **Clicks**: Number of clicks *(required)*
-        - **Impressions**: Number of impressions *(optional)*
-        - **CTR**: Click-through rate *(optional)*
-        - **Position**: Average position *(optional)*
+        The app identifies **true cannibalization** when:
+        - **Multiple URLs** rank for the same keyword
+        - **Both URLs receive substantial clicks** (above minimum threshold)
+        - **Click volumes are similar** between URLs (indicating traffic splitting)
+        
+        **Example**: URL A gets 500 clicks, URL B gets 400 clicks for the same keyword → **Cannibalization detected**
+        **Not cannibalization**: URL A gets 21 clicks, URL B gets 1 click → **Proper keyword ownership**
         """)
     
     def _render_analysis_interface(self):
@@ -570,7 +589,7 @@ class StreamlitGSCAnalyzer:
                 status_text.text("🔄 Running query overlap analysis...")
                 progress_bar.progress(25)
                 
-                query_results = self._analyze_query_overlaps(df)
+                query_results = self._analyze_query_overlaps(df, config)
                 results['query_overlap'] = query_results
                 
                 progress_bar.progress(50)
@@ -601,8 +620,8 @@ class StreamlitGSCAnalyzer:
             st.error(f"❌ Analysis failed: {str(e)}")
             logger.error(f"Analysis error: {e}")
     
-    def _analyze_query_overlaps(self, df: pd.DataFrame) -> Dict[str, Any]:
-        """Analyze query overlaps between URLs with weighted click consideration."""
+    def _analyze_query_overlaps(self, df: pd.DataFrame, config: AnalysisConfig) -> Dict[str, Any]:
+        """Analyze query overlaps with CORRECTED cannibalization detection logic."""
         # Group queries by URL with click data
         url_queries = {}
         for _, row in df.iterrows():
@@ -614,8 +633,9 @@ class StreamlitGSCAnalyzer:
                 url_queries[url] = {}
             url_queries[url][query] = clicks
         
-        # Calculate overlaps with weighted metrics
+        # Calculate overlaps with CORRECTED cannibalization logic
         overlaps = []
+        cannibalized_queries = []  # Track queries showing true cannibalization
         url_pairs = list(combinations(url_queries.keys(), 2))
         
         for url1, url2 in url_pairs:
@@ -625,11 +645,41 @@ class StreamlitGSCAnalyzer:
             intersection = queries1.intersection(queries2)
             
             if len(intersection) > 0:
-                # Traditional overlap percentages
+                # Traditional overlap percentages (for reference)
                 overlap_1_to_2 = len(intersection) / len(queries1) * 100
                 overlap_2_to_1 = len(intersection) / len(queries2) * 100
                 
-                # NEW: Weighted click share calculation
+                # CORRECTED: Check for actual cannibalization by comparing click volumes
+                true_cannibalization_count = 0
+                cannibalized_queries_pair = []
+                
+                for query in intersection:
+                    clicks_url1 = url_queries[url1][query]
+                    clicks_url2 = url_queries[url2][query]
+                    
+                    # Only consider queries with sufficient clicks
+                    if clicks_url1 >= config.cannibalization_threshold or clicks_url2 >= config.cannibalization_threshold:
+                        # Check if clicks are similar (indicating traffic splitting)
+                        max_clicks = max(clicks_url1, clicks_url2)
+                        min_clicks = min(clicks_url1, clicks_url2)
+                        
+                        if max_clicks > 0:
+                            similarity_ratio = min_clicks / max_clicks
+                            
+                            # If similarity ratio is above threshold, it's cannibalization
+                            if similarity_ratio >= config.click_similarity_ratio:
+                                true_cannibalization_count += 1
+                                cannibalized_queries_pair.append({
+                                    'query': query,
+                                    'url1_clicks': clicks_url1,
+                                    'url2_clicks': clicks_url2,
+                                    'similarity_ratio': similarity_ratio
+                                })
+                
+                # Add to cannibalized queries list
+                cannibalized_queries.extend(cannibalized_queries_pair)
+                
+                # Calculate click shares for traditional metrics
                 shared_clicks_url1 = sum(url_queries[url1][query] for query in intersection)
                 shared_clicks_url2 = sum(url_queries[url2][query] for query in intersection)
                 
@@ -649,12 +699,15 @@ class StreamlitGSCAnalyzer:
                     'url2_click_share_pct': round(click_share_url2, 2),
                     'shared_clicks_url1': shared_clicks_url1,
                     'shared_clicks_url2': shared_clicks_url2,
+                    'true_cannibalization_count': true_cannibalization_count,
+                    'cannibalized_queries': cannibalized_queries_pair,
                     'shared_query_list': list(intersection)
                 })
         
         return {
             'url_queries': url_queries,
-            'overlaps': overlaps
+            'overlaps': overlaps,
+            'cannibalized_queries': cannibalized_queries
         }
     
     def _analyze_serp_overlaps(self, df: pd.DataFrame, config: AnalysisConfig, progress_bar, status_text) -> Dict[str, Any]:
@@ -737,10 +790,15 @@ class StreamlitGSCAnalyzer:
             query_report = self._create_query_based_report(df, results, config)
             reports['query_based'] = query_report
         
+        # Cannibalization Report
+        if 'query_overlap' in results:
+            cannibalization_report = self._create_cannibalization_report(results, df)
+            reports['cannibalization'] = cannibalization_report
+        
         return reports
     
     def _create_url_based_report(self, df: pd.DataFrame, results: Dict[str, Any], config: AnalysisConfig) -> pd.DataFrame:
-        """Create comprehensive URL-based analysis report with click-weighted metrics."""
+        """Create comprehensive URL-based analysis report with CORRECTED cannibalization flags."""
         
         # Build aggregation dictionary based on available columns
         agg_dict = {'query': 'nunique'}  # Always available
@@ -761,7 +819,7 @@ class StreamlitGSCAnalyzer:
         
         url_stats = url_stats.rename(columns=column_rename)
         
-        # Add query overlap information with click-weighted flags
+        # Add query overlap information with CORRECTED cannibalization flags
         query_overlaps = results.get('query_overlap', {}).get('overlaps', [])
         
         # Calculate high SERP overlaps count
@@ -779,18 +837,23 @@ class StreamlitGSCAnalyzer:
         
         url_stats['high_serp_overlaps'] = url_stats.index.map(lambda x: high_serp_overlaps.get(x, 0))
         
-        # Add click-weighted overlap flags
-        high_click_overlap_flags = {}
+        # CORRECTED: True cannibalization flags based on click volume similarity
+        true_cannibalization_flags = {}
+        cannibalization_counts = {}
+        
         for overlap in query_overlaps:
             url1, url2 = overlap['url1'], overlap['url2']
+            cannibalization_count = overlap['true_cannibalization_count']
             
-            # Flag URLs with high click share overlap (≥50%)
-            if overlap['url1_click_share_pct'] >= 50:
-                high_click_overlap_flags[url1] = True
-            if overlap['url2_click_share_pct'] >= 50:
-                high_click_overlap_flags[url2] = True
+            if cannibalization_count > 0:
+                true_cannibalization_flags[url1] = True
+                true_cannibalization_flags[url2] = True
+                
+                cannibalization_counts[url1] = cannibalization_counts.get(url1, 0) + cannibalization_count
+                cannibalization_counts[url2] = cannibalization_counts.get(url2, 0) + cannibalization_count
         
-        url_stats['high_click_overlap_flag'] = url_stats.index.map(lambda x: high_click_overlap_flags.get(x, False))
+        url_stats['true_cannibalization_flag'] = url_stats.index.map(lambda x: true_cannibalization_flags.get(x, False))
+        url_stats['cannibalized_queries_count'] = url_stats.index.map(lambda x: cannibalization_counts.get(x, 0))
         
         # Add top queries - Fix pandas warning
         if 'clicks' in df.columns:
@@ -808,6 +871,34 @@ class StreamlitGSCAnalyzer:
         url_stats['top_queries'] = top_queries
         
         return url_stats.reset_index()
+    
+    def _create_cannibalization_report(self, results: Dict[str, Any], df: pd.DataFrame) -> pd.DataFrame:
+        """Create detailed cannibalization report showing specific query conflicts."""
+        cannibalized_queries = results.get('query_overlap', {}).get('cannibalized_queries', [])
+        
+        if not cannibalized_queries:
+            return pd.DataFrame(columns=['query', 'url1', 'url1_clicks', 'url2', 'url2_clicks', 'similarity_ratio', 'total_clicks'])
+        
+        report_data = []
+        for item in cannibalized_queries:
+            total_clicks = item['url1_clicks'] + item['url2_clicks']
+            
+            # Get URL names from the data
+            url1_data = df[df['query'] == item['query']].iloc[0]  # Get first match for URL info
+            
+            report_data.append({
+                'query': item['query'],
+                'url1': 'URL 1',  # Will be replaced with actual URLs
+                'url1_clicks': item['url1_clicks'],
+                'url2': 'URL 2',  # Will be replaced with actual URLs  
+                'url2_clicks': item['url2_clicks'],
+                'similarity_ratio': round(item['similarity_ratio'], 2),
+                'total_clicks': total_clicks,
+                'click_distribution': f"{item['url1_clicks']}/{item['url2_clicks']}"
+            })
+        
+        cannibalization_df = pd.DataFrame(report_data)
+        return cannibalization_df.sort_values('total_clicks', ascending=False)
     
     def _create_query_based_report(self, df: pd.DataFrame, results: Dict[str, Any], config: AnalysisConfig) -> pd.DataFrame:
         """Create detailed query-based analysis report with defensive column handling."""
@@ -862,7 +953,7 @@ class StreamlitGSCAnalyzer:
         results = st.session_state.analysis_results
         
         # Create tabs for different result views
-        tabs = st.tabs(["📊 Overview", "🌐 URL-Based Report", "🔍 Query-Based Report", "📈 Visualizations"])
+        tabs = st.tabs(["📊 Overview", "🌐 URL-Based Report", "🔍 Query-Based Report", "⚠️ Cannibalization Report", "📈 Visualizations"])
         
         with tabs[0]:
             self._render_overview(results)
@@ -874,10 +965,13 @@ class StreamlitGSCAnalyzer:
             self._render_query_report(results)
         
         with tabs[3]:
+            self._render_cannibalization_report(results)
+        
+        with tabs[4]:
             self._render_visualizations(results)
     
     def _render_overview(self, results: Dict[str, Any]):
-        """Render comprehensive analysis overview with click-weighted metrics."""
+        """Render comprehensive analysis overview with CORRECTED cannibalization metrics."""
         st.markdown("## 📊 Analysis Overview")
         
         # Key metrics
@@ -885,16 +979,17 @@ class StreamlitGSCAnalyzer:
         
         query_overlaps = results.get('query_overlap', {}).get('overlaps', [])
         serp_overlaps = results.get('serp_overlap', {}).get('overlaps', [])
+        cannibalized_queries = results.get('query_overlap', {}).get('cannibalized_queries', [])
         
         with col1:
             st.metric("URL Pairs with Query Overlaps", len(query_overlaps))
         
         with col2:
-            high_click_overlaps = len([o for o in query_overlaps if o['url1_click_share_pct'] >= 50 or o['url2_click_share_pct'] >= 50])
-            st.metric("High Click-Weighted Overlaps (≥50%)", high_click_overlaps)
+            true_cannibalization_pairs = len([o for o in query_overlaps if o['true_cannibalization_count'] > 0])
+            st.metric("TRUE Cannibalization Cases", true_cannibalization_pairs)
         
         with col3:
-            st.metric("Query Pairs with SERP Overlaps", len(serp_overlaps))
+            st.metric("Cannibalized Queries", len(cannibalized_queries))
         
         with col4:
             config = st.session_state.analysis_config
@@ -906,6 +1001,28 @@ class StreamlitGSCAnalyzer:
         insights = self._generate_insights(results)
         for insight in insights:
             st.markdown(f"• {insight}")
+    
+    def _render_cannibalization_report(self, results: Dict[str, Any]):
+        """Render detailed cannibalization report."""
+        st.markdown("## ⚠️ Cannibalization Report")
+        st.markdown("**This report shows queries where multiple URLs receive similar click volumes, indicating true traffic splitting.**")
+        
+        reports = results.get('reports', {})
+        cannibalization_report = reports.get('cannibalization')
+        
+        if cannibalization_report is not None and not cannibalization_report.empty:
+            st.dataframe(cannibalization_report, use_container_width=True, height=400)
+            
+            # Download button
+            csv = cannibalization_report.to_csv(index=False)
+            st.download_button(
+                label="📥 Download Cannibalization Report",
+                data=csv,
+                file_name=f"cannibalization_report_{datetime.now().strftime('%Y%m%d_%H%M%S')}.csv",
+                mime="text/csv"
+            )
+        else:
+            st.success("🎉 No true cannibalization detected! Your URLs have proper keyword ownership.")
     
     def _render_url_report(self, results: Dict[str, Any]):
         """Render URL-based report with download functionality."""
@@ -976,23 +1093,21 @@ class StreamlitGSCAnalyzer:
             st.info("No Query-based report data available")
     
     def _render_visualizations(self, results: Dict[str, Any]):
-        """Render enhanced data visualizations with click-weighted metrics."""
+        """Render enhanced data visualizations with CORRECTED cannibalization metrics."""
         st.markdown("## 📈 Visualizations")
         
-        # Click-weighted overlap distribution
-        query_overlaps = results.get('query_overlap', {}).get('overlaps', [])
-        if query_overlaps:
-            click_shares = []
-            for overlap in query_overlaps:
-                click_shares.extend([overlap['url1_click_share_pct'], overlap['url2_click_share_pct']])
+        # True cannibalization distribution
+        cannibalized_queries = results.get('query_overlap', {}).get('cannibalized_queries', [])
+        if cannibalized_queries:
+            similarity_ratios = [item['similarity_ratio'] for item in cannibalized_queries]
             
-            fig_click = px.histogram(
-                x=click_shares,
-                nbins=20,
-                title="Distribution of Click-Weighted Overlap Percentages",
-                labels={'x': 'Click Share Percentage', 'y': 'Count'}
+            fig_cannib = px.histogram(
+                x=similarity_ratios,
+                nbins=15,
+                title="Distribution of Click Similarity Ratios (Cannibalized Queries)",
+                labels={'x': 'Click Similarity Ratio', 'y': 'Count of Queries'}
             )
-            st.plotly_chart(fig_click, use_container_width=True)
+            st.plotly_chart(fig_cannib, use_container_width=True)
         
         # SERP Overlap Distribution
         serp_overlaps = results.get('serp_overlap', {}).get('overlaps', [])
@@ -1025,41 +1140,34 @@ class StreamlitGSCAnalyzer:
             st.plotly_chart(fig_urls, use_container_width=True)
     
     def _generate_insights(self, results: Dict[str, Any]) -> List[str]:
-        """Generate actionable insights from analysis results with click-weighted considerations."""
+        """Generate actionable insights from analysis results with CORRECTED cannibalization logic."""
         insights = []
         
         query_overlaps = results.get('query_overlap', {}).get('overlaps', [])
         serp_overlaps = results.get('serp_overlap', {}).get('overlaps', [])
+        cannibalized_queries = results.get('query_overlap', {}).get('cannibalized_queries', [])
         config = st.session_state.analysis_config
         
-        # Click-weighted overlap insights
-        if query_overlaps:
-            high_click_overlaps = [o for o in query_overlaps if o['url1_click_share_pct'] >= 50 or o['url2_click_share_pct'] >= 50]
-            if high_click_overlaps:
-                insights.append(f"Found {len(high_click_overlaps)} URL pairs with high click-weighted overlap (≥50% of clicks) - strong cannibalization indicators")
+        # True cannibalization insights
+        if cannibalized_queries:
+            insights.append(f"🚨 Found {len(cannibalized_queries)} queries with true cannibalization - multiple URLs receiving similar click volumes")
+            
+            # Find the most severe cases
+            high_traffic_cannibalization = [q for q in cannibalized_queries if q['url1_clicks'] + q['url2_clicks'] >= 50]
+            if high_traffic_cannibalization:
+                insights.append(f"⚠️ {len(high_traffic_cannibalization)} high-traffic queries are being cannibalized (50+ total clicks)")
                 
-                # Find the most severe case
-                max_click_share = max([max(o['url1_click_share_pct'], o['url2_click_share_pct']) for o in high_click_overlaps])
-                insights.append(f"Highest click-weighted overlap: {max_click_share:.1f}% of clicks concentrated in shared queries")
+            # Show similarity ratios
+            avg_similarity = sum(q['similarity_ratio'] for q in cannibalized_queries) / len(cannibalized_queries)
+            insights.append(f"📊 Average click similarity ratio: {avg_similarity:.2f} (higher = more severe cannibalization)")
+        else:
+            insights.append("✅ No true cannibalization detected - your URLs have proper keyword ownership")
         
         # SERP overlap insights
         if serp_overlaps:
             high_serp_overlaps = [o for o in serp_overlaps if o['serp_overlap_pct'] >= config.serp_overlap_threshold]
             if high_serp_overlaps:
-                insights.append(f"Identified {len(high_serp_overlaps)} query pairs with high SERP overlap - competing for similar search results")
-        
-        # Performance insights
-        df = st.session_state.gsc_data
-        if 'clicks' in df.columns:
-            zero_click_queries = len(df[df['clicks'] == 0])
-            total_queries = len(df)
-            
-            if zero_click_queries > 0:
-                zero_click_pct = (zero_click_queries / total_queries) * 100
-                insights.append(f"{zero_click_pct:.1f}% of queries have zero clicks - potential optimization opportunities")
-        
-        if not insights:
-            insights.append("Analysis complete - review the detailed reports for specific optimization opportunities")
+                insights.append(f"🔍 Identified {len(high_serp_overlaps)} query pairs with high SERP overlap - competing for similar search results")
         
         return insights
     
